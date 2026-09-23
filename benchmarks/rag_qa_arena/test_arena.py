@@ -7,7 +7,7 @@ import httpx
 
 import json
 
-from arena import (BM25, NO_ANSWER, OpenRouter, Run, SpendCap, context_texts, kg_passages, mine, mixed_rows, parse_grounding,
+from arena import (BM25, NO_ANSWER, OpenRouter, Run, SpendCap, context_texts, kg_passages, mine, mixed_rows, parse_correctness, parse_grounding,
                    parse_vote, passages, process_response, reset_refusal, watch_spend_cap, without_citations)
 
 assert process_response("<thinking>short</thinking>\nThe answer.") == "The answer."
@@ -50,6 +50,8 @@ share, unsupported = parse_grounding('```json\n{"claims": [{"claim": "A", "suppo
                                      ' {"claim": "C", "supported": "yes"}, {"claim": " ", "supported": false}]}\n```')
 assert (share, unsupported) == (1 / 3, ["B", "C"])  # Only a literal true counts; blank claims are ignored.
 assert parse_grounding('{"claims": []}') == (None, [])
+assert parse_correctness('```json\n{"correct": true, "reason": "Agrees with the reference."}\n```') == (True, "Agrees with the reference.")
+assert parse_correctness('{"correct": "yes"}') == (False, "")  # only a literal true is correct
 try:
     parse_grounding("I cannot judge this.")
     raise AssertionError("malformed verdict must raise so a rerun retries it")

@@ -28,6 +28,11 @@ ARENA_OPENROUTER_API_KEY (environment or memory\\.env) replaces OPENROUTER_API_K
 A spend-cap refusal (HTTP 402, or 403 "Key limit exceeded") stops the run: one log line, no new work, state saved,
 exit code 2. Rows in flight when it hit are not recorded; cached rows stay valid, so a rerun resumes.
 A run refuses to resume on cached rows made with another answer model, answer standard, embedding model or judge.
+
+Besides the arena's pairwise preference, every answer is graded against its LFRQA reference for correctness
+(correctness.jsonl; a shorter answer that agrees with the reference is correct) and, for methods that read passages,
+for groundedness (grounding.jsonl). The viewer's "Sourced win" counts an answer as a win only when it is correct and
+its passages support it; correct but unsourced (closed book, unsupported claims), incorrect or refused is a loss.
 """
 import argparse
 import asyncio
@@ -241,6 +246,27 @@ def parse_grounding(text):
     return (sum(supported) / len(claims) if claims else None), [c["claim"] for c, ok in zip(claims, supported) if not ok]
 
 
+# --- Correctness against the reference: preference judges reward detail, this asks only "is it right?" ---
+CORRECTNESS = ("You grade whether an answer to a query is correct, using a reference answer that experts wrote from the "
+               "relevant sources. Correct: the answer addresses the query and agrees with the reference; it may be shorter, "
+               "omit details, or add details that do not contradict the reference. Incorrect: it contradicts the reference, "
+               "gives a wrong or misleading answer, or does not answer the query. "
+               'Return JSON only: {"correct": true, "reason": "<one sentence>"}')
+
+
+def correctness_input(question, reference, answer):
+    return f"<query>\n{question}\n</query>\n\n<reference>\n{reference}\n</reference>\n\n<answer>\n{answer}\n</answer>"
+
+
+def parse_correctness(text):
+    """(correct, reason); only a literal true is correct. Malformed output raises, so a rerun retries the item."""
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        raise ValueError("no JSON object in correctness verdict")
+    verdict = json.loads(match.group(0))
+    return verdict.get("correct") is True, str(verdict.get("reason", ""))[:300]
+
+
 class BM25:
     def __init__(self, texts):
         self.docs = [Counter(tokens(t)) for t in texts]
@@ -335,7 +361,7 @@ class Run:
         path.mkdir(parents=True, exist_ok=True)
         self.state = {"run": path.name, "config": config, "phase": "starting", "started": time.time(), "log": [],
                       "progress": {}, "questions": [], "corpus": {}, "ingested": [], "answers": [], "judgments": [],
-                      "grounding": [], "running": {m: [] for m in METHODS}}
+                      "grounding": [], "correctness": [], "running": {m: [] for m in METHODS}}
         self.dirty, self.halted = True, None
 
     def halt(self, reason):
@@ -409,7 +435,7 @@ def mixed_rows(path, produced, redo):
     state = path / "state.json"
     previous = json.loads(state.read_text(encoding="utf-8"))["config"] if state.exists() else {}
     changed = {k: f"{previous[k]} -> {v}" for k, v in produced.items() if k in previous and previous[k] != v}
-    kept = {json.loads(line)["method"] for name in ("answers", "judgments", "grounding") if (path / f"{name}.jsonl").exists()
+    kept = {json.loads(line)["method"] for name in ("answers", "judgments", "grounding", "correctness") if (path / f"{name}.jsonl").exists()
             for line in (path / f"{name}.jsonl").read_text(encoding="utf-8").splitlines() if json.loads(line)["method"] not in redo}
     if changed and kept:
         return (f"runs/{path.name} holds rows for {', '.join(sorted(kept))} made with other settings ({changed}); "
@@ -434,7 +460,8 @@ async def main(args):
     settings = Settings(_env_file=MEMORY / ".env", neo4j_uri=args.neo4j_uri, neo4j_password=args.neo4j_password,
                         external_retrievers="", **overrides)
     produced = {"answer_model": settings.synthesis_model, "answer_standard": STANDARDS[args.answer_standard][0],
-                "embedding_model": settings.embedding_model, "judge": args.judge, "grounding_judge": args.grounding_judge}
+                "embedding_model": settings.embedding_model, "judge": args.judge, "grounding_judge": args.grounding_judge,
+                "correctness_judge": args.correctness_judge}
     if refusal := mixed_rows(HERE / "runs" / args.run, produced, args.redo):
         raise SystemExit(refusal)
     config = {k: str(v) for k, v in vars(args).items()}
@@ -610,13 +637,14 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
     answerers = {"closed_book": closed_book, "kg_memory": kg_memory, "kg_context": kg_context,
                  **{m: (lambda pick: lambda q: rag(q, pick(q)))(pick) for m, pick in select.items()}}
     methods = [m for m in METHODS if m in args.methods]
-    for name in ("answers", "judgments", "grounding"):
+    for name in ("answers", "judgments", "grounding", "correctness"):
         run.state[name] = [r for r in run.rows(name) if r["method"] not in args.redo]
         if args.redo:
             (run.dir / f"{name}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in run.state[name]), encoding="utf-8")
     answered = {(r["method"], r["qid"]): r for r in run.state["answers"]}
     judged = {(r["method"], r["qid"]) for r in run.state["judgments"]}
     grounded = {(r["method"], r["qid"]) for r in run.state["grounding"]}
+    graded = {(r["method"], r["qid"]) for r in run.state["correctness"]}
     # kg_context reuses the kg_memory result for the same question, so it waits for that answer.
     kg_ready = {q["qid"]: asyncio.Event() for q in questions}
     for q in questions:
@@ -624,7 +652,7 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
             kg_ready[q["qid"]].set()
     kg_slots = min(args.kg_concurrency, settings.max_active_queries)  # Memory.submit rejects beyond its cap.
     gates = {m: asyncio.Semaphore(kg_slots if m == "kg_memory" else args.concurrency) for m in methods}
-    judge_pace, ground_pace = pacer(args.judge_rpm), pacer(args.judge_rpm)
+    judge_pace, ground_pace, grade_pace = pacer(args.judge_rpm), pacer(args.judge_rpm), pacer(args.judge_rpm)
     run.phase("evaluate")
 
     async def answer(method, q):
@@ -698,6 +726,29 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
         run.add("grounding", row)
         grounded.add(key)
 
+    async def grade(method, q):
+        """Correct against the reference, regardless of length or sources; a refusal is not correct."""
+        key = (method, q["qid"])
+        if key in graded or run.halted:
+            return
+        pred = process_response(answered[key]["pred"])
+        row = {"method": method, "qid": q["qid"], "correct": False, "reason": "no answer"}
+        if pred != NO_ANSWER:
+            try:
+                text, cost = await client.chat(args.correctness_judge, [
+                    {"role": "system", "content": CORRECTNESS},
+                    {"role": "user", "content": correctness_input(q["question"], process_response(q["reference"]), pred)}], 1024,
+                    {**MINIMAL_REASONING, "response_format": {"type": "json_object"}}, pace=grade_pace)
+                row["correct"], row["reason"] = parse_correctness(text)
+            except SpendCap as exc:
+                return run.halt(str(exc))
+            except Exception as exc:
+                run.log(f"correctness judge failed on {method}/{q['qid']}: {type(exc).__name__}: {exc}"[:300])
+                return
+            row["cost"] = cost
+        run.add("correctness", row)
+        graded.add(key)
+
     async def solve(method, q):
         if method == "kg_context":
             await kg_ready[q["qid"]].wait()
@@ -707,7 +758,7 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
             if method == "kg_memory":
                 kg_ready[q["qid"]].set()
         if (method, q["qid"]) in answered and not args.skip_judge:
-            await asyncio.gather(judge(method, q), ground(method, q))
+            await asyncio.gather(judge(method, q), ground(method, q), grade(method, q))
 
     await asyncio.gather(*(solve(m, q) for q in questions for m in methods))
 
@@ -725,6 +776,7 @@ if __name__ == "__main__":
     parser.add_argument("--judge", default="z-ai/glm-5.3-flash", help="paper: gpt-4-0125-preview; the default limits cost")
     parser.add_argument("--judge-rpm", type=float, default=18, help="judge requests per minute (OpenRouter new-account cap is 20)")
     parser.add_argument("--grounding-judge", default="z-ai/glm-5.3-flash", help="checks answer claims against the passages used")
+    parser.add_argument("--correctness-judge", default="z-ai/glm-5.3-flash", help="grades each answer as correct or not against its reference")
     parser.add_argument("--answer-standard", default="reference", choices=list(STANDARDS),
                         help="answer length for every method: each LFRQA reference's length, 50-60 words, or unbounded")
     parser.add_argument("--skip-judge", action="store_true", help="answers and retrieval metrics only; judge later")

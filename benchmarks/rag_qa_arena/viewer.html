@@ -75,11 +75,11 @@ tr.q:focus-visible td { outline: 2px solid var(--accent); }
     <div class="legend"><span style="--c:var(--win)">method wins</span><span style="--c:var(--tie)">tie</span><span style="--c:var(--loss)">LFRQA wins</span></div>
   </section>
   <section class="card" style="margin-bottom:16px">
-    <h2>Win + tie rate by domain</h2>
+    <h2 id="domains-title">Win + tie rate by domain</h2>
     <div class="scroll"><table id="domains"></table></div>
   </section>
   <section class="card" style="margin-bottom:16px">
-    <h2>Questions</h2>
+    <h2 id="questions-title">Questions</h2>
     <div class="filters" id="filters"></div>
     <div class="scroll"><table id="questions"></table></div>
   </section>
@@ -106,12 +106,14 @@ const words = s => (s || "").split(/\s+/).filter(Boolean).length;
 function verdict(j) { return !j ? null : j.winner === "tie" ? "T" : j.winner === "LFRQA" ? "L" : "W"; }
 
 function index(s) {
-  const ans = {}, jud = {}, gr = {};
+  const ans = {}, jud = {}, gr = {}, cor = {};
   for (const a of s.answers) ans[a.method + "|" + a.qid] = a;
   for (const j of s.judgments) jud[j.method + "|" + j.qid] = j;
   for (const g of s.grounding || []) gr[g.method + "|" + g.qid] = g;
+  for (const c of s.correctness || []) cor[c.method + "|" + c.qid] = c;
   const methods = METHODS.filter(m => s.config.methods ? s.config.methods.includes(m) : true);
-  return {ans, jud, gr, methods};
+  // Graded runs judge each answer on its own (correct + sourced); older runs only have the pairwise preference.
+  return {ans, jud, gr, cor, methods, absolute: (s.correctness || []).length > 0};
 }
 
 function stages(s, {methods}) {
@@ -139,61 +141,79 @@ function stages(s, {methods}) {
     card("4 · Judged vs LFRQA", s.judgments.length, total, `judge ${esc(s.config.judge || "")}`, "var(--win)");
 }
 
-function board(s, {ans, jud, methods}) {
+// Sourced win: correct against the reference AND its passages support it (at least 80% of claims). Correct but
+// unsourced (closed book, unsupported claims), incorrect or refused answers are losses; there are no ties.
+const SOURCED = 0.8;
+const sourcedWin = (c, g) => c.correct && !!g && g.supported != null && g.supported >= SOURCED;
+
+function board(s, {ans, jud, gr, methods}) {
   const inDomain = r => domainFilter === "all" || s.questions.find(q => q.qid === r.qid)?.domain === domainFilter;
   const rows = methods.map(m => {
     const js = s.judgments.filter(j => j.method === m && inDomain(j));
     const supported = mean((s.grounding || []).filter(g => g.method === m && g.supported != null && inDomain(g)).map(g => g.supported));
+    const graded = (s.correctness || []).filter(c => c.method === m && inDomain(c));
+    const correct = graded.length ? graded.filter(c => c.correct).length / graded.length : null;
+    const sourced = graded.length ? graded.filter(c => sourcedWin(c, gr[m + "|" + c.qid])).length / graded.length : null;
     const c = {W: 0, T: 0, L: 0}; js.forEach(j => c[verdict(j)]++);
     const as = s.answers.filter(a => a.method === m);
     const recall = mean(as.filter(a => a.gold_recall != null).map(a => a.gold_recall));
     const cost = as.reduce((t, a) => t + (a.cost || 0), 0);
     const errors = as.filter(a => a.error).length;
-    return {m, c, n: js.length, recall, supported, cost, errors, words: mean(as.map(a => words(a.pred))), secs: mean(as.map(a => a.seconds || 0))};
-  }).sort((a, b) => (b.n ? (b.c.W + b.c.T) / b.n : -1) - (a.n ? (a.c.W + a.c.T) / a.n : -1));
+    return {m, c, n: js.length, recall, supported, correct, sourced, graded: graded.length, cost, errors, words: mean(as.map(a => words(a.pred))), secs: mean(as.map(a => a.seconds || 0))};
+  }).sort((a, b) => a.sourced != null && b.sourced != null ? b.sourced - a.sourced
+    : (b.n ? (b.c.W + b.c.T) / b.n : -1) - (a.n ? (a.c.W + a.c.T) / a.n : -1));
+  const share = x => x == null ? "–" : (100 * x).toFixed(0) + "%";
   const refWords = mean(s.questions.map(q => words(q.reference)));
-  return `<tr><th>Method</th><th class="num">Win</th><th class="num">Win+tie</th><th>Win · tie · loss</th><th class="num">Judged</th>
+  return `<tr><th>Method</th><th class="num" title="Correct against the reference and supported by the method's own passages; everything else is a loss">Sourced win</th><th class="num" title="Correct against the reference, sources ignored">Correct</th><th class="num">Win</th><th class="num">Win+tie</th><th>Win · tie · loss</th><th class="num">Judged</th>
     <th class="num">Gold recall</th><th class="num" title="Mean share of answer claims supported by the passages the method used">Supported</th><th class="num">Avg words</th><th class="num">Avg s</th><th class="num">Answer cost</th><th class="num">Errors</th></tr>` +
-    rows.map(r => `<tr><td>${label(r.m)}</td><td class="num">${pct(r.c.W, r.n)}</td><td class="num"><b>${pct(r.c.W + r.c.T, r.n)}</b></td>
+    rows.map(r => `<tr><td>${label(r.m)}</td><td class="num"><b>${share(r.sourced)}</b></td><td class="num">${share(r.correct)}</td><td class="num">${pct(r.c.W, r.n)}</td><td class="num"><b>${pct(r.c.W + r.c.T, r.n)}</b></td>
       <td><div class="stack">${["W", "T", "L"].map(k => `<i class="${k}" style="width:${r.n ? 100 * r.c[k] / r.n : 0}%" title="${k} ${r.c[k]}"></i>`).join("")}</div></td>
       <td class="num">${r.n}</td><td class="num">${r.recall == null ? "–" : (100 * r.recall).toFixed(0) + "%"}</td>
       <td class="num">${r.supported == null ? "–" : (100 * r.supported).toFixed(0) + "%"}</td>
       <td class="num">${r.words == null ? "–" : r.words.toFixed(0)}</td><td class="num">${r.secs == null ? "–" : r.secs.toFixed(1)}</td>
       <td class="num">${money(r.cost)}</td><td class="num ${r.errors ? "err" : ""}">${r.errors}</td></tr>`).join("") +
-    `<tr><td class="muted">LFRQA reference</td><td colspan="6"></td><td class="num muted">${refWords == null ? "–" : refWords.toFixed(0)}</td><td colspan="3"></td></tr>`;
+    `<tr><td class="muted">LFRQA reference</td><td colspan="8"></td><td class="num muted">${refWords == null ? "–" : refWords.toFixed(0)}</td><td colspan="3"></td></tr>`;
 }
 
-function domains(s, {jud, methods}) {
+function domains(s, {jud, gr, cor, methods, absolute}) {
   const ds = [...new Set(s.questions.map(q => q.domain))];
   return `<tr><th>Method</th>${ds.map(d => `<th class="num">${esc(d)}</th>`).join("")}</tr>` + methods.map(m => `<tr><td>${label(m)}</td>${ds.map(d => {
-    const js = s.questions.filter(q => q.domain === d).map(q => jud[m + "|" + q.qid]).filter(Boolean);
-    const good = js.filter(j => verdict(j) !== "L").length;
-    return `<td class="num">${pct(good, js.length)} <span class="muted">(${js.length})</span></td>`;
+    const qs = s.questions.filter(q => q.domain === d);
+    const verdicts = absolute ? qs.filter(q => cor[m + "|" + q.qid]).map(q => sourcedWin(cor[m + "|" + q.qid], gr[m + "|" + q.qid]))
+                              : qs.map(q => jud[m + "|" + q.qid]).filter(Boolean).map(j => verdict(j) !== "L");
+    return `<td class="num">${pct(verdicts.filter(Boolean).length, verdicts.length)} <span class="muted">(${verdicts.length})</span></td>`;
   }).join("")}</tr>`).join("");
 }
 
-function cell(s, m, q, {ans, jud}) {
-  const j = jud[m + "|" + q.qid], a = ans[m + "|" + q.qid];
-  if (j) return `<span class="chip ${verdict(j)}" title="${esc(LABELS[m])}: ${esc(j.winner)}">${verdict(j)}</span>`;
+function cell(s, m, q, {ans, jud, gr, cor, absolute}) {
+  const j = jud[m + "|" + q.qid], a = ans[m + "|" + q.qid], c = cor[m + "|" + q.qid];
+  if (absolute && c) {
+    const win = sourcedWin(c, gr[m + "|" + q.qid]);
+    const why = win ? "correct and sourced" : c.correct ? "correct but unsourced" : "incorrect: " + c.reason;
+    return `<span class="chip ${win ? "W" : "L"}" title="${esc(LABELS[m])}: ${esc(why)}">${win ? "W" : "L"}</span>`;
+  }
+  if (j && !absolute) return `<span class="chip ${verdict(j)}" title="${esc(LABELS[m])}: ${esc(j.winner)}">${verdict(j)}</span>`;
   if (a) return `<span class="chip A" title="answered, awaiting judge">…</span>`;
   if ((s.running[m] || []).includes(q.qid)) return `<span class="chip R" title="running">●</span>`;
   return `<span class="chip P">·</span>`;
 }
 
-function detail(s, q, {ans, jud, gr, methods}) {
+function detail(s, q, {ans, jud, gr, cor, methods}) {
   const blocks = methods.map(m => {
-    const a = ans[m + "|" + q.qid], j = jud[m + "|" + q.qid], g = gr[m + "|" + q.qid];
+    const a = ans[m + "|" + q.qid], j = jud[m + "|" + q.qid], g = gr[m + "|" + q.qid], c = cor[m + "|" + q.qid];
     if (!a) return `<div class="ans"><h3>${label(m)} <span class="tag">pending</span></h3></div>`;
     const tags = [a.gold_recall != null ? `gold recall ${(100 * a.gold_recall).toFixed(0)}%` : null, `${a.seconds}s`, a.cost ? money(a.cost) : null,
       a.coverage ? `coverage ${a.coverage}` : null, a.nodes_explored != null ? `${a.nodes_explored} nodes` : null,
       a.calls ? `${a.calls} calls` : null, a.fallback ? "synthesis fallback" : null,
-      g && g.supported != null ? `supported ${(100 * g.supported).toFixed(0)}%` : null].filter(Boolean);
+      g && g.supported != null ? `supported ${(100 * g.supported).toFixed(0)}%` : null,
+      c ? (sourcedWin(c, g) ? "sourced win" : c.correct ? "correct, unsourced" : "incorrect") : null].filter(Boolean);
+    const graded = c && c.reason ? `<div class="judge">Correctness: ${esc(c.reason)}</div>` : "";
     const unsupported = g && g.unsupported && g.unsupported.length ? `<div class="judge">Unsupported by its passages:<ul>${g.unsupported.map(c => `<li>${esc(c)}</li>`).join("")}</ul></div>` : "";
     const retrieved = a.retrieved ? `<div class="muted">retrieved: ${a.retrieved.map(d => q.gold.includes(d) ? `<b>${esc(d)}</b>` : esc(d)).join(", ") || "none"}</div>` : "";
     const needs = a.needs ? `<div class="muted">needs: ${a.needs.map(esc).join(" | ")}</div>` : "";
     return `<div class="ans"><h3>${label(m)} ${j ? `<span class="chip ${verdict(j)}">${verdict(j)}</span>` : ""} ${tags.map(t => `<span class="tag">${esc(t)}</span>`).join(" ")}</h3>
       ${a.error ? `<div class="err">${esc(a.error)}</div>` : ""}<p>${esc(a.pred)}</p>${needs}${retrieved}
-      ${j ? `<div class="judge">Judge: ${esc(j.thinking)}</div>` : ""}${unsupported}</div>`;
+      ${j ? `<div class="judge">Judge: ${esc(j.thinking)}</div>` : ""}${graded}${unsupported}</div>`;
   });
   return `<tr class="detail"><td colspan="${methods.length + 2}"><div class="answers">
     <div class="ans"><h3>LFRQA reference <span class="tag">gold: ${q.gold.map(esc).join(", ")}</span></h3><p>${esc(q.reference)}</p></div>${blocks.join("")}</div></td></tr>`;
@@ -215,6 +235,8 @@ function render() {
   $("stages").innerHTML = stages(s, idx);
   $("board").innerHTML = board(s, idx);
   $("domains").innerHTML = domains(s, idx);
+  $("domains-title").textContent = idx.absolute ? "Sourced win rate by domain (correct and supported by its own passages)" : "Win + tie rate by domain";
+  $("questions-title").textContent = idx.absolute ? "Questions: W = correct and sourced, L = unsourced, incorrect or no answer (hover for why)" : "Questions";
   const ds = ["all", ...new Set(s.questions.map(q => q.domain))];
   $("filters").innerHTML = ds.map(d => `<button class="${d === domainFilter ? "on" : ""}" data-d="${esc(d)}">${esc(d)}</button>`).join("");
   $("questions").innerHTML = questions(s, idx);
