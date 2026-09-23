@@ -156,7 +156,7 @@ def concept_text(node, language):
     (the thesaurus is multilingual, extracted concepts mostly English), then its scope note, bounded."""
     labels = [node.label, *(v for lang in dict.fromkeys([language, "en"]) for v in node.pref_labels.get(lang, []) + node.alt_labels.get(lang, []))]
     note = preferred(node.descriptions, language)
-    return truncate(" ; ".join(dict.fromkeys(labels)) + (". " + note if note else ""), 200)
+    return truncate((" ; ".join(dict.fromkeys(labels)) + (". " + note if note else ""))[:1600], 200)
 
 
 async def embed_taxonomy(repository, models, settings, authority=None, batch=32):

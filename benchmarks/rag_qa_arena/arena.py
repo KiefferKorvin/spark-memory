@@ -423,9 +423,10 @@ async def main(args):
     except SpendCap as exc:
         run.halt(str(exc))
     except Exception as exc:
-        run.log(f"FAILED: {type(exc).__name__}: {exc}")
-        run.state["phase"] = "failed"
-        raise
+        if not run.halted:  # e.g. a ProviderError raised by the spend-cap refusal the hook already reported
+            run.log(f"FAILED: {type(exc).__name__}: {exc}")
+            run.state["phase"] = "failed"
+            raise
     finally:
         saver.cancel()
         run.save()
