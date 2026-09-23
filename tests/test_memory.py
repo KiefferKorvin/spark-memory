@@ -271,7 +271,7 @@ async def test_credit_reserved_by_in_flight_requests_is_retried():
     async def handler(request):
         calls.append(request)
         if len(calls) == 1:
-            return httpx.Response(402, json={"error": {"message": "This request would exceed your available credits given your current in-flight requests. Retry after in-flight requests settle, or add credits."}})
+            return httpx.Response(402, headers={"Retry-After": "0.01"}, json={"error": {"message": "This request would exceed your available credits given your current in-flight requests. Retry after in-flight requests settle, or add credits."}})
         return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({"document_type": "note", "summary": "s", "routing_summary": "r"})}}]})
     provider = OpenRouter(settings(provider_retries=1), InMemoryGraph(), httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     assert (await provider.structured("understanding", {"text": "x"}, Understanding)).summary == "s" and len(calls) == 2

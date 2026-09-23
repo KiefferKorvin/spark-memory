@@ -59,15 +59,17 @@ class OpenRouter:
             raise ProviderError("Model input exceeds configured token budget")
         for attempt in range(self.settings.provider_retries + 1):
             started = time.monotonic()
-            usage, status, retryable, reason = {}, "error", True, None
+            usage, status, retryable, reason, wait = {}, "error", True, None, None
             try:
                 response = await self.client.post("https://openrouter.ai" + path, json=body,
                     headers={"Authorization": "Bearer " + self.settings.openrouter_api_key.get_secret_value(),
                              "X-Title": "Progressive Graph Memory"})
                 if not 200 <= response.status_code < 300:
                     # 402 "retry after in-flight requests settle": credit is reserved by concurrent requests, not spent.
-                    retryable = response.status_code in (408, 429) or response.status_code >= 500 or (
-                        response.status_code == 402 and "in-flight" in response.text.lower())
+                    reserved = response.status_code == 402 and "in-flight" in response.text.lower()
+                    retryable = response.status_code in (408, 429) or response.status_code >= 500 or reserved
+                    if reserved:  # wait as long as OpenRouter asks (Retry-After), within reason
+                        wait = min(30.0, float(response.headers.get("retry-after") or 5))
                     raise ProviderError(f"Model provider HTTP {response.status_code}")
                 obj = response.json()
                 usage = obj.get("usage") or {}
@@ -90,7 +92,7 @@ class OpenRouter:
                     "estimated_cost": usage.get("cost"), "latency": time.monotonic()-started,
                     "status": status, "attempt": attempt+1, **({"error": reason} if reason else {}),
                 })
-            await asyncio.sleep(min(0.5 * 2**attempt, 4))
+            await asyncio.sleep(wait if wait is not None else min(0.5 * 2**attempt, 4))
 
     async def structured(self, operation, payload, schema, query_id=None):
         model = self.settings.synthesis_model if operation == "synthesis" else self.settings.semantic_model

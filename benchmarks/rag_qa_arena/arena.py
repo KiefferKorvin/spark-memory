@@ -332,7 +332,7 @@ class OpenRouter:
                                       headers={"Authorization": f"Bearer {key}", "X-Title": "RAG-QA Arena benchmark"})
 
     async def post(self, path, body, pace=None):
-        error = "no attempt"
+        error, wait = "no attempt", None
         for attempt in range(6):
             if pace:
                 await pace()
@@ -343,11 +343,14 @@ class OpenRouter:
                 error = f"HTTP {response.status_code}: {response.text[:200]}"
                 if spend_cap(response.status_code, response.text):
                     raise SpendCap(error)
-                if response.status_code in (400, 401, 402, 403, 404) and not reserved(response.status_code, response.text):
+                if reserved(response.status_code, response.text):
+                    wait = min(30.0, float(response.headers.get("retry-after") or 5))  # as long as OpenRouter asks
+                elif response.status_code in (400, 401, 402, 403, 404):
                     break
             except (httpx.HTTPError, ValueError) as exc:
                 error = type(exc).__name__
-            await asyncio.sleep(min(30, 2 ** attempt))
+            await asyncio.sleep(wait if wait is not None else min(30, 2 ** attempt))
+            wait = None
         raise RuntimeError(f"{path}: {error}")
 
     async def chat(self, model, messages, max_tokens, options=None, pace=None, provider=False):
