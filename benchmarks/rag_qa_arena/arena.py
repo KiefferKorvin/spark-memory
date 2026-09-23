@@ -1,11 +1,13 @@
-"""RAG-QA Arena (Han et al., 2024) for the progressive graph memory versus standard RAG baselines.
+"""RAG-QA Arena data (Han et al., 2024) for the progressive graph memory versus standard RAG baselines.
 
-Faithful to the benchmark: RobustQA/LoTTE test collections, LFRQA reference answers, the benchmark's answer
-templates, and the pairwise judge against LFRQA with the benchmark's own system prompt, few-shot examples,
-answer ordering and rating parser. Methods share one answer model and one mixed corpus.
+From the benchmark: RobustQA/LoTTE test collections, LFRQA reference answers and the answer templates. Methods
+share one answer model and one mixed corpus. Scoring deliberately departs from the arena's pairwise preference
+judge, which rewards the more detailed of two answers: each answer is graded alone. It wins only when it is
+correct (nothing contradicts the reference or is wrong), complete (no major omission of the reference's key
+points) and sourced (every claim supported by the passages the method used); anything else is a loss.
+correctness.jsonl holds the first two verdicts, grounding.jsonl the third (closed book reads no passages).
 
-Every method answers under one length standard, because the judge prefers "more truthful or helpful information"
-and would otherwise score length instead of retrieval. --answer-standard picks it:
+Every method answers under one length standard. --answer-standard picks it:
   reference  (default) the benchmark's `ans_generation_v2.cfg` with its "50-60 words" set, per question, to the length
              of that question's LFRQA reference, so no method is out-worded by the reference either
   50-60      `ans_generation_v2.cfg` as published; the graph memory's synthesis is capped at 60 words
@@ -27,12 +29,8 @@ ARENA_OPENROUTER_API_KEY (environment or memory\\.env) replaces OPENROUTER_API_K
                 graph memory, so benchmarks cannot exhaust the live app's spend cap. state.json records which was used.
 A spend-cap refusal (HTTP 402, or 403 "Key limit exceeded") stops the run: one log line, no new work, state saved,
 exit code 2. Rows in flight when it hit are not recorded; cached rows stay valid, so a rerun resumes.
-A run refuses to resume on cached rows made with another answer model, answer standard, embedding model or judge.
-
-Besides the arena's pairwise preference, every answer is graded against its LFRQA reference for correctness
-(correctness.jsonl; a shorter answer that agrees with the reference is correct) and, for methods that read passages,
-for groundedness (grounding.jsonl). The viewer's "Sourced win" counts an answer as a win only when it is correct and
-its passages support it; correct but unsourced (closed book, unsupported claims), incorrect or refused is a loss.
+A run refuses to resume on cached rows made with another answer model, answer standard, embedding model or judge;
+--rejudge [grounding] [correctness] discards judge verdicts (all by default) and grades the cached answers again.
 """
 import argparse
 import asyncio
@@ -94,12 +92,10 @@ def bounded(prompt, standard, reference):
 # max_tokens, and GLM 5.3 cannot disable reasoning at all (HTTP 400). Models without reasoning ignore the setting.
 JUDGE_TOKENS = {"minimal": 1500, "low": 4096, "medium": 8192, "high": 16384}
 # Which cached rows each recorded setting produced: a changed judge invalidates its verdicts, not the answers.
-PRODUCED_BY = {"answer_model": ("answers", "judgments", "grounding", "correctness"),
-               "answer_standard": ("answers", "judgments", "grounding", "correctness"),
-               "embedding_model": ("answers", "judgments", "grounding", "correctness"),
-               "judge": ("judgments",), "grounding_judge": ("grounding",), "correctness_judge": ("correctness",),
-               "judge_reasoning": ("judgments", "grounding", "correctness")}
-JUDGED = ("judgments", "grounding", "correctness")
+JUDGED = ("grounding", "correctness")
+PRODUCED_BY = {"answer_model": ("answers", *JUDGED), "answer_standard": ("answers", *JUDGED), "embedding_model": ("answers", *JUDGED),
+               "grounding_judge": ("grounding",), "correctness_judge": ("correctness",), "correctness_prompt": ("correctness",),
+               "judge_reasoning": JUDGED}
 
 
 def tokens(text):
@@ -111,7 +107,7 @@ def template(arena, name):
     return text.split('"""')[1]
 
 
-# --- Ported verbatim in behaviour from rag-qa-arena code/utils.py and code/compute_correlation.py ---
+# --- Ported verbatim in behaviour from rag-qa-arena code/utils.py ---
 def remove_elements(response, open="<thinking>", close="</thinking>"):
     start, end = response.find(open), response.find(close)
     if start >= 0 and end >= 0 and start <= end:
@@ -125,15 +121,6 @@ def process_response(response):
     for tag in ("Answer: ", "Answer:\n", "<answer>"):
         response = response.replace(tag, "").replace("</answer>", "")
     return NO_ANSWER if response == "FAIL TO GENERATE ANS." else response
-
-
-def parse_vote(pred):
-    found = re.findall(r"<rating>.*\d+.*</rating>", pred, flags=re.DOTALL)
-    rating, score = found[0] if found else pred, 0
-    for i in range(3):
-        if str(i) in rating:
-            score = i
-    return score
 
 
 # --- Data preparation ---
@@ -252,12 +239,14 @@ def parse_grounding(text):
     return (sum(supported) / len(claims) if claims else None), [c["claim"] for c, ok in zip(claims, supported) if not ok]
 
 
-# --- Correctness against the reference: preference judges reward detail, this asks only "is it right?" ---
-CORRECTNESS = ("You grade whether an answer to a query is correct, using a reference answer that experts wrote from the "
-               "relevant sources. Correct: the answer addresses the query and agrees with the reference; it may be shorter, "
-               "omit details, or add details that do not contradict the reference. Incorrect: it contradicts the reference, "
-               "gives a wrong or misleading answer, or does not answer the query. "
-               'Return JSON only: {"correct": true, "reason": "<one sentence>"}')
+# --- Correctness and completeness against the reference, one answer at a time (never a comparison) ---
+CORRECTNESS_VERSION = "2"  # recorded per run, so verdicts of another prompt version are never mixed
+CORRECTNESS = ("You grade one answer to a query against a reference answer that experts wrote from the relevant sources. "
+               "Judge the answer on its own merits and do not reward length. correct: true when the answer addresses the "
+               "query and states nothing that contradicts the reference or is wrong; extra details that do not contradict "
+               "the reference are fine. major_omission: true when the answer leaves out a key point of the reference that "
+               "is needed to answer the query; missing minor details, examples or nuances is not a major omission. "
+               'Return JSON only: {"correct": true, "major_omission": false, "reason": "<one sentence>"}')
 
 
 def correctness_input(question, reference, answer):
@@ -265,12 +254,15 @@ def correctness_input(question, reference, answer):
 
 
 def parse_correctness(text):
-    """(correct, reason); only a literal true is correct. Malformed output raises, so a rerun retries the item."""
+    """(correct, major_omission, reason). Only a literal true is correct, and an omission counts unless it is a
+    literal false. Malformed or incomplete output raises, so a rerun retries the item."""
     match = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if not match:
         raise ValueError("no JSON object in correctness verdict")
     verdict = json.loads(match.group(0))
-    return verdict.get("correct") is True, str(verdict.get("reason", ""))[:300]
+    if not {"correct", "major_omission"} <= verdict.keys():
+        raise ValueError("correctness verdict lacks correct or major_omission")
+    return verdict["correct"] is True, verdict["major_omission"] is not False, str(verdict.get("reason", ""))[:300]
 
 
 class BM25:
@@ -366,7 +358,7 @@ class Run:
         self.dir = path
         path.mkdir(parents=True, exist_ok=True)
         self.state = {"run": path.name, "config": config, "phase": "starting", "started": time.time(), "log": [],
-                      "progress": {}, "questions": [], "corpus": {}, "ingested": [], "answers": [], "judgments": [],
+                      "progress": {}, "questions": [], "corpus": {}, "ingested": [], "answers": [],
                       "grounding": [], "correctness": [], "running": {m: [] for m in METHODS}}
         self.dirty, self.halted = True, None
 
@@ -435,14 +427,14 @@ def reset_refusal(uri, live_uri):
     return None
 
 
-def mixed_rows(path, produced, redo, rejudge=False):
+def mixed_rows(path, produced, redo, rejudge=()):
     """Why cached rows of this run must not be mixed with new ones, or None: rows made with another answer model,
     answer standard, embedding model or judge would share a leaderboard with rows that are not comparable.
     Only the rows a changed setting produced count, and --rejudge discards every judge's rows."""
     state = path / "state.json"
     previous = json.loads(state.read_text(encoding="utf-8"))["config"] if state.exists() else {}
     changed = {k: f"{previous[k]} -> {v}" for k, v in produced.items() if k in previous and previous[k] != v}
-    files = {name for k in changed for name in PRODUCED_BY[k]} - (set(JUDGED) if rejudge else set())
+    files = {name for k in changed for name in PRODUCED_BY[k]} - set(rejudge)
     kept = {json.loads(line)["method"] for name in sorted(files) if (path / f"{name}.jsonl").exists()
             for line in (path / f"{name}.jsonl").read_text(encoding="utf-8").splitlines() if json.loads(line)["method"] not in redo}
     if kept:
@@ -468,8 +460,9 @@ async def main(args):
     settings = Settings(_env_file=MEMORY / ".env", neo4j_uri=args.neo4j_uri, neo4j_password=args.neo4j_password,
                         external_retrievers="", **overrides)
     produced = {"answer_model": settings.synthesis_model, "answer_standard": STANDARDS[args.answer_standard][0],
-                "embedding_model": settings.embedding_model, "judge": args.judge, "grounding_judge": args.grounding_judge,
-                "correctness_judge": args.correctness_judge, "judge_reasoning": args.judge_reasoning}
+                "embedding_model": settings.embedding_model, "grounding_judge": args.grounding_judge,
+                "correctness_judge": args.correctness_judge, "correctness_prompt": CORRECTNESS_VERSION,
+                "judge_reasoning": args.judge_reasoning}
     if refusal := mixed_rows(HERE / "runs" / args.run, produced, args.redo, args.rejudge):
         raise SystemExit(refusal)
     config = {k: str(v) for k, v in vars(args).items()}
@@ -572,15 +565,6 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
     standard = args.answer_standard
     _, answer_file, closed_prompt = STANDARDS[standard]
     answer_template = template(args.arena, answer_file)
-    pair_template = template(args.arena, "pairwise_lfrqa.cfg")
-    system = (args.arena / "templates" / "pairwise_lfrqa_system.txt").read_text(encoding="utf-8")
-    examples = json.loads((args.arena / "templates" / "pairwise_lfrqa_examples.json").read_text(encoding="utf-8"))
-
-    def pair(query, r1, r2):
-        return pair_template.replace("{x.question}", query).replace("{x.response1}", r1).replace("{x.response2}", r2)
-
-    shots = [m for ex in examples for m in ({"role": "user", "content": pair(ex["query"], ex["response_1"], ex["response_2"])},
-             {"role": "assistant", "content": f"<thinking>{ex['thinking']}</thinking><rating>{ex['label']}</rating>"})]
 
     async def rag(q, chosen):
         prompt = answer_template.replace("{x.passages}", "".join(f"<passage{i+1}>\n{p['text']}\n</passage>\n" for i, p in enumerate(chosen)))
@@ -646,11 +630,10 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
                  **{m: (lambda pick: lambda q: rag(q, pick(q)))(pick) for m, pick in select.items()}}
     methods = [m for m in METHODS if m in args.methods]
     for name in ("answers", *JUDGED):
-        run.state[name] = [] if args.rejudge and name in JUDGED else [r for r in run.rows(name) if r["method"] not in args.redo]
+        run.state[name] = [] if name in args.rejudge else [r for r in run.rows(name) if r["method"] not in args.redo]
         if args.redo or args.rejudge:
             (run.dir / f"{name}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in run.state[name]), encoding="utf-8")
     answered = {(r["method"], r["qid"]): r for r in run.state["answers"]}
-    judged = {(r["method"], r["qid"]) for r in run.state["judgments"]}
     grounded = {(r["method"], r["qid"]) for r in run.state["grounding"]}
     graded = {(r["method"], r["qid"]) for r in run.state["correctness"]}
     # kg_context reuses the kg_memory result for the same question, so it waits for that answer.
@@ -660,8 +643,19 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
             kg_ready[q["qid"]].set()
     kg_slots = min(args.kg_concurrency, settings.max_active_queries)  # Memory.submit rejects beyond its cap.
     gates = {m: asyncio.Semaphore(kg_slots if m == "kg_memory" else args.concurrency) for m in methods}
-    judge_pace, ground_pace, grade_pace = pacer(args.judge_rpm), pacer(args.judge_rpm), pacer(args.judge_rpm)
-    judge_options = {"reasoning": {"effort": args.judge_reasoning, "exclude": True}}
+    ground_pace, grade_pace = pacer(args.judge_rpm), pacer(args.judge_rpm)
+    # Price-weighted routing picked slow providers that cap output near 4k tokens: high reasoning then used it all
+    # (657 s, empty verdict). Throughput routing avoids them, and an empty or malformed verdict is asked again.
+    judge_options = {"reasoning": {"effort": args.judge_reasoning, "exclude": True}, "provider": {"sort": "throughput"}}
+
+    async def verdict(model, messages, parse, pace):
+        for attempt in range(3):
+            text, cost = await client.chat(model, messages, judge_tokens, {**judge_options, "response_format": {"type": "json_object"}}, pace=pace)
+            try:
+                return parse(text), cost
+            except (ValueError, KeyError, TypeError):
+                if attempt == 2:
+                    raise
     judge_tokens = JUDGE_TOKENS[args.judge_reasoning]
     run.phase("evaluate")
 
@@ -690,31 +684,8 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
             answered[key] = row = {"method": method, "qid": q["qid"], **row, "seconds": round(time.monotonic() - started, 1)}
             run.add("answers", row)
 
-    async def judge(method, q):
-        key = (method, q["qid"])
-        if key in judged or run.halted:
-            return
-        pred, reference = process_response(answered[key]["pred"]), process_response(q["reference"])
-        first = len(q["question"].split(" ")) % 2 == 0  # Benchmark's order rule (LFRQADataProcessor).
-        order = {1: method, 2: "LFRQA"} if first else {1: "LFRQA", 2: method}
-        r1, r2 = (pred, reference) if first else (reference, pred)
-        try:
-            text, cost = await client.chat(args.judge, [{"role": "system", "content": system}, *shots,
-                                                        {"role": "user", "content": pair(q["question"], r1, r2)}], judge_tokens, judge_options, pace=judge_pace)
-        except SpendCap as exc:
-            return run.halt(str(exc))
-        except Exception as exc:
-            # Not recorded: the benchmark would score this as a tie; a rerun retries it instead.
-            run.log(f"judge failed on {method}/{q['qid']}: {exc}")
-            return
-        vote = parse_vote(text)
-        thinking = re.search(r"<thinking>(.*?)</thinking>", text, flags=re.DOTALL)
-        run.add("judgments", {"method": method, "qid": q["qid"], "winner": order[vote] if vote else "tie",
-                              "vote": vote, "order": order, "thinking": thinking.group(1).strip() if thinking else text[:500], "cost": cost})
-        judged.add(key)
-
     async def ground(method, q):
-        """Extra column beside the arena's pairwise metric: the share of answer claims its own passages support."""
+        """Sourced: the share of answer claims its own passages support (a win needs all of them)."""
         key = (method, q["qid"])
         if method not in GROUNDED or key in grounded or run.halted:
             return
@@ -723,10 +694,8 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
         if row["applicable"]:
             try:
                 prompt = grounding_input(await used(method, q), pred)
-                text, cost = await client.chat(args.grounding_judge, [{"role": "system", "content": GROUNDING},
-                                                                      {"role": "user", "content": prompt}], judge_tokens,
-                                               {**judge_options, "response_format": {"type": "json_object"}}, pace=ground_pace)
-                share, unsupported = parse_grounding(text)
+                (share, unsupported), cost = await verdict(args.grounding_judge, [{"role": "system", "content": GROUNDING},
+                                                                                  {"role": "user", "content": prompt}], parse_grounding, ground_pace)
             except SpendCap as exc:
                 return run.halt(str(exc))
             except Exception as exc:
@@ -737,19 +706,18 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
         grounded.add(key)
 
     async def grade(method, q):
-        """Correct against the reference, regardless of length or sources; a refusal is not correct."""
+        """Correct and complete against the reference, regardless of length or sources; a refusal is neither."""
         key = (method, q["qid"])
         if key in graded or run.halted:
             return
         pred = process_response(answered[key]["pred"])
-        row = {"method": method, "qid": q["qid"], "correct": False, "reason": "no answer"}
+        row = {"method": method, "qid": q["qid"], "correct": False, "major_omission": False, "reason": "no answer"}
         if pred != NO_ANSWER:
             try:
-                text, cost = await client.chat(args.correctness_judge, [
+                (row["correct"], row["major_omission"], row["reason"]), cost = await verdict(args.correctness_judge, [
                     {"role": "system", "content": CORRECTNESS},
-                    {"role": "user", "content": correctness_input(q["question"], process_response(q["reference"]), pred)}], judge_tokens,
-                    {**judge_options, "response_format": {"type": "json_object"}}, pace=grade_pace)
-                row["correct"], row["reason"] = parse_correctness(text)
+                    {"role": "user", "content": correctness_input(q["question"], process_response(q["reference"]), pred)}],
+                    parse_correctness, grade_pace)
             except SpendCap as exc:
                 return run.halt(str(exc))
             except Exception as exc:
@@ -768,7 +736,7 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
             if method == "kg_memory":
                 kg_ready[q["qid"]].set()
         if (method, q["qid"]) in answered and not args.skip_judge:
-            await asyncio.gather(judge(method, q), ground(method, q), grade(method, q))
+            await asyncio.gather(ground(method, q), grade(method, q))
 
     await asyncio.gather(*(solve(m, q) for q in questions for m in methods))
 
@@ -782,13 +750,13 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--methods", nargs="+", default=METHODS, choices=METHODS)
     parser.add_argument("--redo", nargs="*", default=[], choices=METHODS,
-                        help="discard cached answers/judgments/grounding of these methods (kg_memory implies kg_context)")
-    parser.add_argument("--judge", default="z-ai/glm-5.3-flash", help="paper: gpt-4-0125-preview; the default limits cost")
-    parser.add_argument("--judge-rpm", type=float, default=18, help="judge requests per minute (OpenRouter new-account cap is 20)")
+                        help="discard cached answers and verdicts of these methods (kg_memory implies kg_context)")
+    parser.add_argument("--judge-rpm", type=float, default=18, help="requests per minute for each judge (OpenRouter new-account cap is 20)")
     parser.add_argument("--grounding-judge", default="z-ai/glm-5.3-flash", help="checks answer claims against the passages used")
     parser.add_argument("--correctness-judge", default="z-ai/glm-5.3-flash", help="grades each answer as correct or not against its reference")
     parser.add_argument("--judge-reasoning", default="minimal", choices=list(JUDGE_TOKENS), help="hidden reasoning effort of all three judges")
-    parser.add_argument("--rejudge", action="store_true", help="discard every judge's cached verdicts and judge the cached answers again")
+    parser.add_argument("--rejudge", nargs="*", choices=JUDGED, default=None,
+                        help="discard cached verdicts of these judges (all when none are named) and grade the cached answers again")
     parser.add_argument("--answer-standard", default="reference", choices=list(STANDARDS),
                         help="answer length for every method: each LFRQA reference's length, 50-60 words, or unbounded")
     parser.add_argument("--skip-judge", action="store_true", help="answers and retrieval metrics only; judge later")
@@ -805,6 +773,7 @@ if __name__ == "__main__":
     parser.add_argument("--references", type=Path, default=Path("C:/code/benchmarks/rag-qa-arena/data/data"))
     parser.add_argument("--lotte", type=Path, default=Path("C:/code/benchmarks/robustqa-acl23/data/lotte"))
     arguments = parser.parse_args()
+    arguments.rejudge = JUDGED if arguments.rejudge == [] else tuple(arguments.rejudge or ())
     if "kg_memory" in arguments.redo and "kg_context" not in arguments.redo:
         arguments.redo.append("kg_context")  # kg_context is derived from the kg_memory result.
     sys.exit(asyncio.run(main(arguments)))

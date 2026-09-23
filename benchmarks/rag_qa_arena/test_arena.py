@@ -8,14 +8,11 @@ import httpx
 import json
 
 from arena import (BM25, NO_ANSWER, OpenRouter, Run, SpendCap, context_texts, kg_passages, mine, mixed_rows, parse_correctness, parse_grounding,
-                   parse_vote, passages, process_response, reset_refusal, watch_spend_cap, without_citations)
+                   passages, process_response, reset_refusal, watch_spend_cap, without_citations)
 
 assert process_response("<thinking>short</thinking>\nThe answer.") == "The answer."
 assert process_response("Thought: x Answer: The answer.") == "The answer."
 assert process_response("FAIL TO GENERATE ANS.") == NO_ANSWER
-assert parse_vote("<thinking>Answer 1 lacks detail.</thinking><rating>2</rating>") == 2
-assert parse_vote("<rating>0</rating>") == 0
-assert parse_vote("no rating at all") == 0
 assert without_citations("Retries need idempotency [c:1][c:2]. See [note].", {"c:1", "c:2"}) == "Retries need idempotency. See [note]."
 assert without_citations("Both [a, b].", {"a", "b"}) == "Both."
 assert [p["text"] for p in passages([{"id": "d", "text": " ".join(map(str, range(150)))}])][1].startswith("100 ")
@@ -50,8 +47,13 @@ share, unsupported = parse_grounding('```json\n{"claims": [{"claim": "A", "suppo
                                      ' {"claim": "C", "supported": "yes"}, {"claim": " ", "supported": false}]}\n```')
 assert (share, unsupported) == (1 / 3, ["B", "C"])  # Only a literal true counts; blank claims are ignored.
 assert parse_grounding('{"claims": []}') == (None, [])
-assert parse_correctness('```json\n{"correct": true, "reason": "Agrees with the reference."}\n```') == (True, "Agrees with the reference.")
-assert parse_correctness('{"correct": "yes"}') == (False, "")  # only a literal true is correct
+assert parse_correctness('```json\n{"correct": true, "major_omission": false, "reason": "Agrees."}\n```') == (True, False, "Agrees.")
+assert parse_correctness('{"correct": "yes", "major_omission": null}') == (False, True, "")  # only literal true / false count
+try:
+    parse_correctness('{"correct": true}')
+    raise AssertionError("a verdict without major_omission must be retried, not assumed complete")
+except ValueError:
+    pass
 try:
     parse_grounding("I cannot judge this.")
     raise AssertionError("malformed verdict must raise so a rerun retries it")
@@ -120,11 +122,12 @@ with tempfile.TemporaryDirectory() as root:
     assert mixed_rows(old, {**now, "answer_model": "deepseek"}, []) is None  # unrecorded keys (answer_standard) never block
     assert mixed_rows(Path(root) / "new", now, []) is None
     # A changed judge only invalidates judge rows: answers can be judged again with --rejudge.
-    (old / "state.json").write_text(json.dumps({"config": {"answer_model": "glm", "judge": "glm"}}), encoding="utf-8")
-    (old / "judgments.jsonl").write_text(json.dumps({"method": "bm25_rag", "qid": "q"}) + "\n", encoding="utf-8")
-    stronger = {"answer_model": "glm", "judge": "deepseek"}
-    assert "judgments rows" in mixed_rows(old, stronger, [])
-    assert mixed_rows(old, stronger, [], rejudge=True) is None
+    (old / "state.json").write_text(json.dumps({"config": {"answer_model": "glm", "correctness_judge": "glm"}}), encoding="utf-8")
+    (old / "correctness.jsonl").write_text(json.dumps({"method": "bm25_rag", "qid": "q"}) + "\n", encoding="utf-8")
+    stronger = {"answer_model": "glm", "correctness_judge": "deepseek"}
+    assert "correctness rows" in mixed_rows(old, stronger, [])
+    assert mixed_rows(old, stronger, [], rejudge=("correctness",)) is None
+    assert "correctness rows" in mixed_rows(old, stronger, [], rejudge=("grounding",))
 
 # Threshold calibration: the lowest threshold whose accepted links are >= 90% correct on 5+ labeled links.
 import contextlib, io  # noqa: E401,E402
