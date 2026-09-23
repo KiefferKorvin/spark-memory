@@ -90,10 +90,16 @@ def bounded(prompt, standard, reference):
     if V2_LIMIT not in prompt:
         raise ValueError("answer prompt lacks the ans_generation_v2.cfg length sentence")
     return prompt.replace(V2_LIMIT, f"Your answer should not be longer than {word_limit(standard, reference)} words.")
-# GLM 5.3 cannot disable reasoning (HTTP 400); its tokens count against max_tokens, so judges get room beyond the
-# benchmark's 256. Models without reasoning ignore this.
-MINIMAL_REASONING = {"reasoning": {"effort": "minimal", "exclude": True}}
-JUDGE_TOKENS = 1024
+# Judges' hidden reasoning effort (--judge-reasoning) and the output cap it needs: reasoning tokens count against
+# max_tokens, and GLM 5.3 cannot disable reasoning at all (HTTP 400). Models without reasoning ignore the setting.
+JUDGE_TOKENS = {"minimal": 1500, "low": 4096, "medium": 8192, "high": 16384}
+# Which cached rows each recorded setting produced: a changed judge invalidates its verdicts, not the answers.
+PRODUCED_BY = {"answer_model": ("answers", "judgments", "grounding", "correctness"),
+               "answer_standard": ("answers", "judgments", "grounding", "correctness"),
+               "embedding_model": ("answers", "judgments", "grounding", "correctness"),
+               "judge": ("judgments",), "grounding_judge": ("grounding",), "correctness_judge": ("correctness",),
+               "judge_reasoning": ("judgments", "grounding", "correctness")}
+JUDGED = ("judgments", "grounding", "correctness")
 
 
 def tokens(text):
@@ -429,17 +435,19 @@ def reset_refusal(uri, live_uri):
     return None
 
 
-def mixed_rows(path, produced, redo):
+def mixed_rows(path, produced, redo, rejudge=False):
     """Why cached rows of this run must not be mixed with new ones, or None: rows made with another answer model,
-    answer standard, embedding model or judge would share a leaderboard with rows that are not comparable."""
+    answer standard, embedding model or judge would share a leaderboard with rows that are not comparable.
+    Only the rows a changed setting produced count, and --rejudge discards every judge's rows."""
     state = path / "state.json"
     previous = json.loads(state.read_text(encoding="utf-8"))["config"] if state.exists() else {}
     changed = {k: f"{previous[k]} -> {v}" for k, v in produced.items() if k in previous and previous[k] != v}
-    kept = {json.loads(line)["method"] for name in ("answers", "judgments", "grounding", "correctness") if (path / f"{name}.jsonl").exists()
+    files = {name for k in changed for name in PRODUCED_BY[k]} - (set(JUDGED) if rejudge else set())
+    kept = {json.loads(line)["method"] for name in sorted(files) if (path / f"{name}.jsonl").exists()
             for line in (path / f"{name}.jsonl").read_text(encoding="utf-8").splitlines() if json.loads(line)["method"] not in redo}
-    if changed and kept:
-        return (f"runs/{path.name} holds rows for {', '.join(sorted(kept))} made with other settings ({changed}); "
-                "start a new --run, or --redo those methods")
+    if kept:
+        return (f"runs/{path.name} holds {', '.join(sorted(files))} rows for {', '.join(sorted(kept))} made with other settings "
+                f"({changed}); start a new --run, --redo those methods, or --rejudge for judge changes")
     return None
 
 
@@ -461,8 +469,8 @@ async def main(args):
                         external_retrievers="", **overrides)
     produced = {"answer_model": settings.synthesis_model, "answer_standard": STANDARDS[args.answer_standard][0],
                 "embedding_model": settings.embedding_model, "judge": args.judge, "grounding_judge": args.grounding_judge,
-                "correctness_judge": args.correctness_judge}
-    if refusal := mixed_rows(HERE / "runs" / args.run, produced, args.redo):
+                "correctness_judge": args.correctness_judge, "judge_reasoning": args.judge_reasoning}
+    if refusal := mixed_rows(HERE / "runs" / args.run, produced, args.redo, args.rejudge):
         raise SystemExit(refusal)
     config = {k: str(v) for k, v in vars(args).items()}
     run = Run(HERE / "runs" / args.run, config)
@@ -637,9 +645,9 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
     answerers = {"closed_book": closed_book, "kg_memory": kg_memory, "kg_context": kg_context,
                  **{m: (lambda pick: lambda q: rag(q, pick(q)))(pick) for m, pick in select.items()}}
     methods = [m for m in METHODS if m in args.methods]
-    for name in ("answers", "judgments", "grounding", "correctness"):
-        run.state[name] = [r for r in run.rows(name) if r["method"] not in args.redo]
-        if args.redo:
+    for name in ("answers", *JUDGED):
+        run.state[name] = [] if args.rejudge and name in JUDGED else [r for r in run.rows(name) if r["method"] not in args.redo]
+        if args.redo or args.rejudge:
             (run.dir / f"{name}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in run.state[name]), encoding="utf-8")
     answered = {(r["method"], r["qid"]): r for r in run.state["answers"]}
     judged = {(r["method"], r["qid"]) for r in run.state["judgments"]}
@@ -653,6 +661,8 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
     kg_slots = min(args.kg_concurrency, settings.max_active_queries)  # Memory.submit rejects beyond its cap.
     gates = {m: asyncio.Semaphore(kg_slots if m == "kg_memory" else args.concurrency) for m in methods}
     judge_pace, ground_pace, grade_pace = pacer(args.judge_rpm), pacer(args.judge_rpm), pacer(args.judge_rpm)
+    judge_options = {"reasoning": {"effort": args.judge_reasoning, "exclude": True}}
+    judge_tokens = JUDGE_TOKENS[args.judge_reasoning]
     run.phase("evaluate")
 
     async def answer(method, q):
@@ -690,7 +700,7 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
         r1, r2 = (pred, reference) if first else (reference, pred)
         try:
             text, cost = await client.chat(args.judge, [{"role": "system", "content": system}, *shots,
-                                                        {"role": "user", "content": pair(q["question"], r1, r2)}], JUDGE_TOKENS, MINIMAL_REASONING, pace=judge_pace)
+                                                        {"role": "user", "content": pair(q["question"], r1, r2)}], judge_tokens, judge_options, pace=judge_pace)
         except SpendCap as exc:
             return run.halt(str(exc))
         except Exception as exc:
@@ -714,8 +724,8 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
             try:
                 prompt = grounding_input(await used(method, q), pred)
                 text, cost = await client.chat(args.grounding_judge, [{"role": "system", "content": GROUNDING},
-                                                                      {"role": "user", "content": prompt}], 1500,
-                                               {**MINIMAL_REASONING, "response_format": {"type": "json_object"}}, pace=ground_pace)
+                                                                      {"role": "user", "content": prompt}], judge_tokens,
+                                               {**judge_options, "response_format": {"type": "json_object"}}, pace=ground_pace)
                 share, unsupported = parse_grounding(text)
             except SpendCap as exc:
                 return run.halt(str(exc))
@@ -737,8 +747,8 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
             try:
                 text, cost = await client.chat(args.correctness_judge, [
                     {"role": "system", "content": CORRECTNESS},
-                    {"role": "user", "content": correctness_input(q["question"], process_response(q["reference"]), pred)}], 1024,
-                    {**MINIMAL_REASONING, "response_format": {"type": "json_object"}}, pace=grade_pace)
+                    {"role": "user", "content": correctness_input(q["question"], process_response(q["reference"]), pred)}], judge_tokens,
+                    {**judge_options, "response_format": {"type": "json_object"}}, pace=grade_pace)
                 row["correct"], row["reason"] = parse_correctness(text)
             except SpendCap as exc:
                 return run.halt(str(exc))
@@ -777,6 +787,8 @@ if __name__ == "__main__":
     parser.add_argument("--judge-rpm", type=float, default=18, help="judge requests per minute (OpenRouter new-account cap is 20)")
     parser.add_argument("--grounding-judge", default="z-ai/glm-5.3-flash", help="checks answer claims against the passages used")
     parser.add_argument("--correctness-judge", default="z-ai/glm-5.3-flash", help="grades each answer as correct or not against its reference")
+    parser.add_argument("--judge-reasoning", default="minimal", choices=list(JUDGE_TOKENS), help="hidden reasoning effort of all three judges")
+    parser.add_argument("--rejudge", action="store_true", help="discard every judge's cached verdicts and judge the cached answers again")
     parser.add_argument("--answer-standard", default="reference", choices=list(STANDARDS),
                         help="answer length for every method: each LFRQA reference's length, 50-60 words, or unbounded")
     parser.add_argument("--skip-judge", action="store_true", help="answers and retrieval metrics only; judge later")

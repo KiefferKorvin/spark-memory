@@ -119,6 +119,12 @@ with tempfile.TemporaryDirectory() as root:
     assert mixed_rows(old, now, ["bm25_rag"]) is None  # redone rows are discarded, so nothing is mixed
     assert mixed_rows(old, {**now, "answer_model": "deepseek"}, []) is None  # unrecorded keys (answer_standard) never block
     assert mixed_rows(Path(root) / "new", now, []) is None
+    # A changed judge only invalidates judge rows: answers can be judged again with --rejudge.
+    (old / "state.json").write_text(json.dumps({"config": {"answer_model": "glm", "judge": "glm"}}), encoding="utf-8")
+    (old / "judgments.jsonl").write_text(json.dumps({"method": "bm25_rag", "qid": "q"}) + "\n", encoding="utf-8")
+    stronger = {"answer_model": "glm", "judge": "deepseek"}
+    assert "judgments rows" in mixed_rows(old, stronger, [])
+    assert mixed_rows(old, stronger, [], rejudge=True) is None
 
 # Threshold calibration: the lowest threshold whose accepted links are >= 90% correct on 5+ labeled links.
 import contextlib, io  # noqa: E401,E402
