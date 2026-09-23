@@ -66,7 +66,10 @@ STANDARDS = {
         "the <query></query> tags.\n\n<query>\n{q}\n</query>\n\nFirst, think step by step, and put your thinking in "
         "<thinking> tags. Your thinking must be shorter than 50 words. Then, provide your answer."),
 }
-NO_REASONING = {"reasoning": {"enabled": False}}  # judges answer within 256 tokens; hidden reasoning would eat them
+# GLM 5.3 cannot disable reasoning (HTTP 400); its tokens count against max_tokens, so judges get room beyond the
+# benchmark's 256. Models without reasoning ignore this.
+MINIMAL_REASONING = {"reasoning": {"effort": "minimal", "exclude": True}}
+JUDGE_TOKENS = 1024
 
 
 def tokens(text):
@@ -639,7 +642,7 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
         r1, r2 = (pred, reference) if first else (reference, pred)
         try:
             text, cost = await client.chat(args.judge, [{"role": "system", "content": system}, *shots,
-                                                        {"role": "user", "content": pair(q["question"], r1, r2)}], 256, NO_REASONING, pace=judge_pace)
+                                                        {"role": "user", "content": pair(q["question"], r1, r2)}], JUDGE_TOKENS, MINIMAL_REASONING, pace=judge_pace)
         except SpendCap as exc:
             return run.halt(str(exc))
         except Exception as exc:
@@ -664,7 +667,7 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
                 prompt = grounding_input(await used(method, q), pred)
                 text, cost = await client.chat(args.grounding_judge, [{"role": "system", "content": GROUNDING},
                                                                       {"role": "user", "content": prompt}], 1500,
-                                               {**NO_REASONING, "response_format": {"type": "json_object"}}, pace=ground_pace)
+                                               {**MINIMAL_REASONING, "response_format": {"type": "json_object"}}, pace=ground_pace)
                 share, unsupported = parse_grounding(text)
             except SpendCap as exc:
                 return run.halt(str(exc))
@@ -707,7 +710,7 @@ if __name__ == "__main__":
     parser.add_argument("--skip-judge", action="store_true", help="answers and retrieval metrics only; judge later")
     parser.add_argument("--reset-graph", action="store_true", help="wipe the benchmark graph and re-ingest (never the live one)")
     parser.add_argument("--passages", type=int, default=5)
-    parser.add_argument("--answer-tokens", type=int, default=512)
+    parser.add_argument("--answer-tokens", type=int, default=1024, help="cap including hidden reasoning; length is set by the prompt")
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--kg-concurrency", type=int, default=4)
     parser.add_argument("--ingest-concurrency", type=int, default=6)

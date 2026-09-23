@@ -14,8 +14,10 @@ class Settings(BaseSettings):
     # since judges tend to prefer longer answers.
     answer_max_words: int = Field(0, ge=0, le=2000)
     # Merged into every structured chat request. OpenRouter's default routing is price-weighted and can land on
-    # very slow providers (observed: 84 s vs 3 s per call); these extraction tasks also do not need hidden reasoning.
-    openrouter_options: dict = {"provider": {"sort": "throughput", "require_parameters": True}, "reasoning": {"enabled": False}}
+    # very slow providers (observed: 84 s vs 3 s per call). These extraction tasks need little hidden reasoning, but
+    # GLM 5.3 rejects disabling it (HTTP 400), so it runs at minimal effort (~10 tokens) and is not returned.
+    openrouter_options: dict = {"provider": {"sort": "throughput", "require_parameters": True},
+                                "reasoning": {"effort": "minimal", "exclude": True}}
     primary_ontology: str = "UNESCO"
     public_web_enabled: bool = True
     embedding_model: str = ""
