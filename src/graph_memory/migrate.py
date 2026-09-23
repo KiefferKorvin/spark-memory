@@ -12,8 +12,9 @@ from .ingestion import embedding_text
 from .unesco import embed_taxonomy
 
 
-async def reembed(repository, models, settings, batch=32):
-    """Nodes whose vector already has EMBEDDING_DIMENSIONS are skipped, so an interrupted run resumes."""
+async def reembed(repository, models, settings, batch=8):
+    """Nodes whose vector already has EMBEDDING_DIMENSIONS are skipped, so an interrupted run resumes.
+    Eight texts of at most a chunk (~1k tokens) each keep a request inside MODEL_INPUT_TOKEN_BUDGET."""
     count = 0
     while nodes := await repository.stale_embeddings(settings.embedding_dimensions, batch):
         for node, vector in zip(nodes, await models.embed_batch([embedding_text(n) for n in nodes])):
