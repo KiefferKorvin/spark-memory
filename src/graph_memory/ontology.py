@@ -2,6 +2,7 @@ import asyncio
 
 from .llm import ProviderError
 from .models import Concept, ConceptSpec, Edge, ExternalConcept, Relation, Resolution, TaxonomyResolution, stable_id
+from .prompts import VERSION
 
 # ponytail: fixed fan-out for classification calls; make it a setting if provider rate limits bite.
 CONCURRENCY = 6
@@ -12,15 +13,15 @@ class Skip(ValueError):
 
     Reasons: low_confidence, unknown_reuse_id, unanchored_reuse, no_parent, unknown_parent_id, no_anchor,
     provider_error, invalid_concept."""
-    def __init__(self, reason, spec, decision=None, candidates=None):
+    def __init__(self, reason, spec, decision=None, candidates=None, record=None):
         super().__init__(f"{reason}: {spec.label}")
         shown = candidates or {}
 
         def named(i):
             return {"id": i, "label": getattr(shown.get(i), "label", None)}
-        self.record = {"label": spec.label, "reason": reason, "confidence": decision.confidence if decision else None,
-                       "reuse": named(decision.reuse_id) if decision and decision.reuse_id else None,
-                       "parents": [named(i) for i in decision.parent_ids] if decision else [], "candidates": len(shown)}
+        self.record = record or {"label": spec.label, "reason": reason, "confidence": decision.confidence if decision else None,
+                                 "reuse": named(decision.reuse_id) if decision and decision.reuse_id else None,
+                                 "parents": [named(i) for i in decision.parent_ids] if decision else [], "candidates": len(shown)}
 
 
 def skip_record(spec, exc):
@@ -75,13 +76,17 @@ class OntologyService:
     A concept that cannot be classified soundly is skipped rather than rejecting its whole document:
     the text stays retrievable through fulltext/vector indexes and no orphan concept is created.
     Each skip is a Skip.record, so a review sees the reason instead of a bare label.
+
+    Confidence in [provisional, threshold) with valid proposed parents creates a LOCAL concept marked
+    classification_status="provisional" instead of skipping it. Model-decided skips are cached per label
+    (MemoryRecord "classification_skip") so later documents do not pay for the same verdict again.
     """
-    def __init__(self, repository, models, threshold=0.75, authority="UNESCO", embedding_model=""):
+    def __init__(self, repository, models, threshold=0.75, authority="UNESCO", embedding_model="", provisional=0.5, cache=True):
         self.repository = repository
         self.authority, self.embedding_model = authority, embedding_model
-        self.models, self.threshold = models, threshold
+        self.models, self.threshold, self.provisional = models, threshold, min(provisional, threshold)
         self.resolver = ConceptResolver(repository, models)
-        self.semantic = False
+        self.semantic, self.cache = False, cache
 
     async def link(self, specs, pending, query_id=None):
         if await self.repository.read_record("taxonomy", self.authority):
@@ -108,6 +113,8 @@ class OntologyService:
         # Semantic candidates only once the thesaurus is embedded with this model (unesco --embed).
         embedded = await self.repository.read_record("taxonomy_embedding", self.authority)
         self.semantic = bool(embedded) and embedded["model"] == self.embedding_model
+        if self.cache:
+            await self.skip_cache_scope()
         resolved, edges, skipped, failed = {}, [], [], set()
         remaining, gate = list(specs), asyncio.Semaphore(CONCURRENCY)
 
@@ -126,6 +133,9 @@ class OntologyService:
                 if isinstance(result, (ValueError, ProviderError)):
                     skipped.append(skip_record(spec, result))
                     failed.add(spec.label.casefold())
+                    # Only a model's verdict is remembered; provider errors are transient.
+                    if self.cache and isinstance(result, Skip) and result.record["confidence"] is not None and not result.record.get("cached"):
+                        await self.repository.record("classification_skip", self.skip_key(spec), result.record)
                     continue
                 if isinstance(result, BaseException):
                     raise result
@@ -151,6 +161,8 @@ class OntologyService:
         anchors = await self.anchors_for(exact, pending) if exact else []
         if exact and anchors:
             return exact, anchors, [], []
+        if self.cache and (cached := await self.repository.read_record("classification_skip", self.skip_key(spec))):
+            raise Skip(cached["reason"], spec, record={**cached, "label": spec.label, "cached": True})
         # The label and broader labels name the concept; free-text descriptions mostly add generic words.
         query = " ".join([spec.label, *spec.broader])
         vector = await self.models.embed(". ".join([spec.label, ", ".join(spec.broader), spec.description])[:1000], query_id) if self.semantic else None
@@ -169,7 +181,9 @@ class OntologyService:
             candidates[exact.id] = exact
         decision = await self.models.structured("taxonomy_resolution", {
             "authority": self.authority, "candidate": spec.model_dump(), "existing": [dict(id=n.id, label=n.label, aliases=n.aliases, description=n.description, origin=n.origin) for n in candidates.values()]}, TaxonomyResolution, query_id)
-        if decision.confidence < self.threshold:
+        provisional = decision.confidence < self.threshold
+        # Reuse means equivalence, so it needs full confidence; a new child of sound parents may be provisional.
+        if decision.confidence < self.provisional or provisional and decision.reuse_id:
             raise Skip("low_confidence", spec, decision, candidates)
         if decision.reuse_id:
             if decision.reuse_id not in candidates:
@@ -189,9 +203,26 @@ class OntologyService:
             raise Skip("no_anchor", spec, decision, candidates)
         concept = exact or Concept(id=stable_id("concept", ("" if self.authority == "UNESCO" else self.authority + ":") + spec.label.strip().casefold()), label=spec.label.strip(), preferred_label=spec.label.strip(), aliases=spec.aliases, description=spec.description, summary=spec.description, routing_summary=spec.description)
         concept.metadata["taxonomy_anchor_ids"] = sorted({n.id for n in anchors})
+        if provisional:
+            concept.metadata.update(classification_status="provisional", classification_confidence=decision.confidence)
         parents = sorted(set(decision.parent_ids))
         return concept, anchors, [candidates[i] for i in parents], [
             Edge(source=i, target=concept.id, relation=Relation.BROADER_THAN) for i in parents]
+
+    def skip_key(self, spec):
+        return f"{self.authority}:{spec.label.strip().casefold()}"
+
+    async def skip_cache_scope(self):
+        """Cached verdicts hold for one thesaurus snapshot, threshold pair and prompt version; a change clears them."""
+        manifest = await self.repository.read_record("taxonomy", self.authority) or {}
+        scope = {"fingerprint": manifest.get("fingerprint"), "threshold": self.threshold,
+                 "provisional": self.provisional, "prompt_version": VERSION}
+        if await self.repository.read_record("classification_skip_scope", self.authority) != scope:
+            await self.clear_skip_cache()
+            await self.repository.record("classification_skip_scope", self.authority, scope)
+
+    async def clear_skip_cache(self):
+        await self.repository.delete_records("classification_skip", self.authority + ":")
 
     async def anchors_for(self, node, pending):
         if node.origin == self.authority:

@@ -16,7 +16,7 @@ class IngestionEngine:
         self.settings, self.repository, self.models = settings, repository, models
         self.sources = SourceService(settings)
         self.ontology = OntologyService(repository, models, settings.taxonomy_match_threshold, settings.primary_ontology,
-                                        settings.embedding_model)
+                                        settings.embedding_model, settings.taxonomy_provisional_threshold)
         # Per-document locks avoid duplicate inference for identical content while unrelated
         # documents (e.g. several external sources found by one query) ingest concurrently.
         self.locks = weakref.WeakValueDictionary()
@@ -80,11 +80,18 @@ class IngestionEngine:
             edges.extend(Edge(source=node.id, target=i, relation=Relation.ABOUT) for i in sorted(about))
         await self.repository.put(list(pending.values()), edges)
         reasons = Counter(s["reason"] for s in skipped)
+        # Provisional concepts this document links (new or reused) await confirmation beside the skips.
+        provisional = [{"label": n.label, "concept_id": n.id, "confidence": n.metadata.get("classification_confidence"),
+                        "parents": sorted(pending[e.source].label for e in edges if e.relation == Relation.BROADER_THAN
+                                          and e.target == n.id and e.source in pending)}
+                       for n in pending.values() if n.metadata.get("classification_status") == "provisional"]
+        if skipped or provisional:
+            await self.repository.record("classification_review", document_id,
+                                         {"document_id": document_id, "skipped": skipped, "provisional": provisional})
         if skipped:
-            await self.repository.record("classification_review", document_id, {"document_id": document_id, "skipped": skipped})
             logger.warning("Document %s: %d of %d concepts not classified (%s)", document_id, len(skipped), len(specs),
                            ", ".join(f"{reason} {count}" for reason, count in reasons.most_common()))
-        return {"concepts_linked": len(pending), "concepts_extracted": len(specs),
+        return {"concepts_linked": len(pending), "concepts_extracted": len(specs), "concepts_provisional": len(provisional),
                 "unclassified_concepts": [s["label"] for s in skipped], "classification_skips": dict(reasons)}
 
     def linked(self, task):

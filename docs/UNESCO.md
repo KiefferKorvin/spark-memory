@@ -73,10 +73,16 @@ considérés. Plusieurs parents sont permis ; les dépendances locales sont
 résolues dans l'ordre avant l'écriture transactionnelle.
 
 Un concept LOCAL doit descendre d'UNESCO. Les identifiants inconnus, parents
-absents et décisions de confiance inférieure à `TAXONOMY_MATCH_THRESHOLD`
-(0,75 par défaut) interrompent l'ingestion sans créer d'orphelin. Le score est
-une estimation du modèle, pas une garantie de justesse ; corriger l'information
-ou la classification puis relancer en cas d'échec.
+absents et décisions de confiance inférieure à `TAXONOMY_PROVISIONAL_THRESHOLD`
+(0,5 par défaut) écartent le concept sans créer d'orphelin ni rejeter le
+document ; chaque écart est consigné avec sa raison dans l'enregistrement
+`classification_review` du document. Entre ce seuil et `TAXONOMY_MATCH_THRESHOLD`
+(0,75 par défaut), un nouvel enfant de parents valides est créé à titre
+provisoire (`classification_status="provisional"`) et listé pour confirmation ;
+la réutilisation d'un concept existant exige toujours la pleine confiance. Un
+verdict d'écart est mémorisé par libellé jusqu'au changement d'instantané, de
+seuil ou de version des prompts (`--clear-classification-cache` l'efface). Le
+score est une estimation du modèle, pas une garantie de justesse.
 
 Les documents, sections et passages obtiennent des relations `ABOUT` vers les
 concepts retenus et leurs ancrages UNESCO. L'ingestion ne peut pas modifier les

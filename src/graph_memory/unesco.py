@@ -186,16 +186,18 @@ async def main():
     parser.add_argument("path", nargs="?", help="Local UNESCO .ttl/.rdf file or directory to import")
     parser.add_argument("--embed", action="store_true",
                         help="Embed imported concepts for classification (paid embeddings; resumable, skips unchanged)")
+    parser.add_argument("--clear-classification-cache", action="store_true",
+                        help="Forget cached skip verdicts so every concept is classified again")
     parser.add_argument("--language", default="fr")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verify-formats", action="store_true", help="Compare .ttl and .rdf semantic content")
     parser.add_argument("--report", help="Write import manifest as JSON")
     args = parser.parse_args()
-    if not args.path and not args.embed:
-        parser.error("give a thesaurus path to import, --embed, or both")
+    if not (args.path or args.embed or args.clear_classification_cache):
+        parser.error("give a thesaurus path to import, --embed and/or --clear-classification-cache")
     if args.path:
         await import_command(args)
-    if args.embed:
+    if args.embed or args.clear_classification_cache:
         from .config import Settings
         from .graph import Neo4jGraph
         from .llm import OpenRouter
@@ -204,7 +206,11 @@ async def main():
         models = OpenRouter(settings, repository)
         try:
             await repository.initialize()
-            print(json.dumps(await embed_taxonomy(repository, models, settings), indent=2))
+            if args.clear_classification_cache:
+                await repository.delete_records("classification_skip", settings.primary_ontology + ":")
+                print("classification skip cache cleared")
+            if args.embed:
+                print(json.dumps(await embed_taxonomy(repository, models, settings), indent=2))
         finally:
             await models.close()
             await repository.close()

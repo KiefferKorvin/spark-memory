@@ -85,6 +85,7 @@ class GraphRepository(Protocol):
     async def record(self, category: str, key: str, data: dict): ...
     async def read_record(self, category: str, key: str) -> dict | None: ...
     async def records(self, category: str, prefix: str = "", after: str | None = None) -> list[dict]: ...
+    async def delete_records(self, category: str, prefix: str = ""): ...
     async def hit(self, node_id: str, success: bool = False) -> int: ...
 
 
@@ -288,6 +289,10 @@ class InMemoryGraph:
     async def records(self, category, prefix="", after=None):
         return [json.loads(json.dumps(v)) for (c, k), v in sorted(self.data.items())
                 if c == category and k.startswith(prefix) and (after is None or k > after)]
+
+    async def delete_records(self, category, prefix=""):
+        for key in [k for k in self.data if k[0] == category and k[1].startswith(prefix)]:
+            del self.data[key]
 
     async def hit(self, node_id, success=False):
         self.stats[node_id]["successful_retrievals" if success else "navigation_hits"] += 1
@@ -518,6 +523,10 @@ class Neo4jGraph:
                               "AND ($after IS NULL OR r.key > $after) "
                               "RETURN r.payload AS payload ORDER BY r.key", category=category, prefix=prefix, after=after)
         return [json.loads(r["payload"]) for r in rows]
+
+    async def delete_records(self, category, prefix=""):
+        await self.run("MATCH (r:MemoryRecord {category:$category}) WHERE r.key STARTS WITH $prefix DELETE r",
+                       category=category, prefix=prefix)
 
     async def hit(self, node_id, success=False):
         field = "successful_retrievals" if success else "navigation_hits"

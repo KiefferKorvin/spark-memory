@@ -90,4 +90,17 @@ async def spend_cap_stops_the_run():
         await memory_client.aclose()
 
 asyncio.run(spend_cap_stops_the_run())
+
+# Threshold calibration: the lowest threshold whose accepted links are >= 90% correct on 5+ labeled links.
+import contextlib, io  # noqa: E401,E402
+from replay_mapping import calibrate  # noqa: E402
+with tempfile.TemporaryDirectory() as root:
+    sheet = Path(root) / "review.csv"
+    rows = [(.95, "y")] * 4 + [(.85, "y"), (.82, "y"), (.72, "n"), (.7, "y"), (.62, "n"), (.6, "n"), (.9, "")]
+    sheet.write_text("concept,description,domain,proposal,confidence,outcome,accept\n" +
+                     "".join(f"c{i},,d,parents X,{c},o,{a}\n" for i, (c, a) in enumerate(rows)), encoding="utf-8")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        calibrate(sheet)
+    assert "10 labeled proposals" in out.getvalue() and "proposed TAXONOMY_MATCH_THRESHOLD=0.75" in out.getvalue(), out.getvalue()
 print("ok")

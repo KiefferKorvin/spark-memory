@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     unesco_label_language: str = "fr"
     unesco_required: bool = True
     taxonomy_match_threshold: float = Field(0.75, ge=0, le=1)
+    # Confidence from here up to the match threshold links a new LOCAL concept provisionally instead of skipping it.
+    taxonomy_provisional_threshold: float = Field(0.5, ge=0, le=1)
     memory_api_token: SecretStr = SecretStr("")
     allowed_source_hosts: str = ""
     # Comma-separated online fallbacks for gaps in memory: wikipedia, pubmed, web (DuckDuckGo). Empty disables.
@@ -66,6 +68,8 @@ class Settings(BaseSettings):
             raise ValueError("target_chunk_tokens must not exceed max_chunk_tokens")
         if self.min_root_children > self.max_root_children:
             raise ValueError("min_root_children must not exceed max_root_children")
+        if self.taxonomy_provisional_threshold > self.taxonomy_match_threshold:
+            raise ValueError("taxonomy_provisional_threshold must not exceed taxonomy_match_threshold")
         return self
 
     def validate_live(self):

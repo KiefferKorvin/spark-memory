@@ -401,6 +401,7 @@ async def main(args):
                                api_key_source="ARENA_OPENROUTER_API_KEY" if key else "OPENROUTER_API_KEY",
                                kg={k: getattr(settings, k) for k in ("max_total_nodes_explored", "max_depth", "max_parallel_branches",
                                    "max_children_per_decision", "max_root_children", "min_root_children", "candidate_limit", "navigation_excerpt_tokens",
+                                   "taxonomy_match_threshold", "taxonomy_provisional_threshold",
                                    "context_token_budget", "query_timeout_seconds")})
     client = OpenRouter(settings.openrouter_api_key.get_secret_value())
     memory = Memory.from_settings(settings)
@@ -449,7 +450,8 @@ async def ingest(args, run, memory, corpus):
                 row = {"doc_id": doc["id"], "kg_document_id": result["document_id"], "duplicate": result["duplicate"],
                        "nodes": result.get("nodes_created"), "concepts": result.get("concepts_linked"),
                        "unclassified": len(result.get("unclassified_concepts") or []),
-                       "extracted": result.get("concepts_extracted"), "skips": result.get("classification_skips")}
+                       "extracted": result.get("concepts_extracted"), "skips": result.get("classification_skips"),
+                       "provisional": result.get("concepts_provisional")}
             except Exception as exc:
                 row = {"doc_id": doc["id"], "error": f"{type(exc).__name__}: {exc}"[:300]}
                 if not run.halted:

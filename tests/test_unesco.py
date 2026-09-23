@@ -237,3 +237,66 @@ async def test_failed_broader_concept_does_not_take_its_child_down(taxonomy):
         [ConceptSpec(label='Music theory', broader=['Bad parent']), ConceptSpec(label='Bad parent')], {})
     assert [k['label'] for k in skipped] == ['Bad parent']
     assert {n.label for n in linked['music theory']} == {'Music theory', 'Musique'}
+
+
+class Counting:
+    """Proposes Musique as parent with a fixed confidence and counts the paid decisions."""
+    def __init__(self, confidence, reuse=False):
+        self.confidence, self.reuse, self.calls = confidence, reuse, 0
+
+    async def structured(self, operation, payload, schema, query_id=None):
+        self.calls += 1
+        music = next(e['id'] for e in payload['existing'] if e['label'] == 'Musique')
+        return TaxonomyResolution(reuse_id=music if self.reuse else None, parent_ids=[] if self.reuse else [music], confidence=self.confidence)
+
+
+async def test_provisional_link_between_lower_bound_and_threshold(taxonomy):
+    repo = await loaded(taxonomy)
+    ontology = OntologyService(repo, Counting(.6), threshold=.75, provisional=.5)
+    pending = {}
+    linked, edges, skipped = await ontology.link([ConceptSpec(label='Music theory', broader=['Music'])], pending)
+    concept = next(n for n in linked['music theory'] if n.origin == 'LOCAL')
+    assert not skipped and concept.metadata['classification_status'] == 'provisional'
+    assert concept.metadata['classification_confidence'] == .6 and {n.label for n in linked['music theory']} == {'Music theory', 'Musique'}
+    # Reuse claims equivalence, so the same confidence is not enough to reuse an official concept.
+    _, _, skipped = await OntologyService(repo, Counting(.6, reuse=True)).link([ConceptSpec(label='Tunes', broader=['Music'])], {})
+    assert [k['reason'] for k in skipped] == ['low_confidence']
+    # Below the lower bound nothing is created.
+    _, _, skipped = await OntologyService(repo, Counting(.4)).link([ConceptSpec(label='Chords', broader=['Music'])], {})
+    assert [k['reason'] for k in skipped] == ['low_confidence']
+
+
+async def test_provisional_concepts_are_listed_for_review(taxonomy):
+    from graph_memory.config import Settings
+    from graph_memory.demo import DemoModels
+    from graph_memory.models import IngestRequest
+    from graph_memory.service import Memory
+    class Unsure(DemoModels):
+        async def structured(self, operation, payload, schema, query_id=None):
+            result = await super().structured(operation, payload, schema, query_id)
+            return result.model_copy(update={'confidence': .6}) if operation == 'taxonomy_resolution' else result
+    memory = Memory(Settings(memory_mode='demo', _env_file=None), await loaded(taxonomy), Unsure())
+    result = await memory.ingest(IngestRequest(title='Note', text='Piano and music.'))
+    review = await memory.repository.read_record('classification_review', result['document_id'])
+    assert result['concepts_provisional'] == 1 and [(p['label'], p['confidence'], p['parents']) for p in review['provisional']] == [('Piano', .6, ['Musique'])]
+    about = {memory.repository.nodes[e.target].label for e in memory.repository.edges.values() if e.source == result['document_id'] and e.relation == Relation.ABOUT}
+    assert 'Piano' in about  # retrievable like any concept
+    await memory.close()
+
+
+async def test_skip_verdicts_are_cached_until_their_scope_changes(taxonomy):
+    repo = await loaded(taxonomy)
+    model = Counting(.2)
+    spec = [ConceptSpec(label='Obscure idea', broader=['Music'])]
+    _, _, first = await OntologyService(repo, model).link(spec, {})
+    _, _, second = await OntologyService(repo, model).link(spec, {})  # a later document, same label
+    assert model.calls == 1 and second[0]['reason'] == 'low_confidence' and second[0]['cached'] and 'cached' not in first[0]
+    await OntologyService(repo, model, threshold=.8).link(spec, {})  # threshold changed: verdicts cleared
+    assert model.calls == 2
+    ontology = OntologyService(repo, model, threshold=.8)
+    await ontology.clear_skip_cache()  # manual clear
+    await ontology.link(spec, {})
+    assert model.calls == 3
+    fresh = Counting(.2)
+    await OntologyService(repo, fresh, threshold=.8, cache=False).link(spec, {})  # the replay decides afresh
+    assert fresh.calls == 1
