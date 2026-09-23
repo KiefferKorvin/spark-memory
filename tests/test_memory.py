@@ -432,6 +432,38 @@ async def test_answer_length_cap_per_query_overrides_the_setting():
     assert Models.limits == [60, 84]
 
 
+async def test_overlong_answer_is_rewritten_within_its_limit():
+    from graph_memory.models import Answer, QueryRequest
+    class Wordy(DemoModels):
+        drafts = []
+        async def structured(self, operation, payload, schema, query_id=None):
+            if operation != "synthesis":
+                return await super().structured(operation, payload, schema, query_id)
+            evidence_id = payload["evidence"][0]["id"]
+            if "draft_answer" in payload:
+                self.drafts.append(payload["draft_answer"])
+                return Answer(answer=f"Short answer [{evidence_id}].", evidence_ids=[evidence_id])
+            return Answer(answer=" ".join(["word"] * 40) + f" [{evidence_id}]", evidence_ids=[evidence_id])
+    memory = Memory(settings(), InMemoryGraph(), Wordy())
+    await seed(memory)
+    result = await memory.query(QueryRequest(query="What is the purpose of rootless voicings?", allow_external=False, answer_max_words=10))
+    assert result["answer"].startswith("Short answer") and len(Wordy.drafts) == 1
+    event = next(e for e in await memory.events(result["query_id"]) if e["event_type"] == "ANSWER_SHORTENED")
+    assert (event["metadata"]["words_before"], event["metadata"]["words_after"]) == (40, 2)  # citations not counted
+    Wordy.drafts.clear()
+    await memory.query(QueryRequest(query="What is the purpose of rootless voicings?", allow_external=False, answer_max_words=40))
+    assert not Wordy.drafts  # within the limit: no rewrite
+
+
+def test_context_puts_the_most_relevant_evidence_first():
+    from graph_memory.models import Need
+    def item(i, score):
+        return Evidence(id=i, information_need_ids=["N1"], source_node_id=i, source_type="chunk", text=i,
+                        relevance_score=score, confidence=1, provenance={"sources": []})
+    context = ContextBuilder(5000).build([Need(id="N1", description="x")], [item("weak", .3), item("strong", .9), item("mid", .6)])
+    assert [e["id"] for e in context] == ["strong", "mid", "weak"]
+
+
 async def test_reembedding_after_a_dimension_change_is_resumable():
     from graph_memory.ingestion import embedding_text
     from graph_memory.migrate import reembed

@@ -79,6 +79,7 @@ async def test_synthesis_uses_requested_model_and_repairs_invalid_citations():
     hybrid = OnlineDemoModels(online)
     result = await hybrid.structured('synthesis', {'evidence':[{'id':'E1','text':'Evidence'}]}, Answer)
     assert '[E1]' in result.answer and len(calls) == 2
+    assert 'Synthesis must cite supplied evidence IDs inline' in calls[1]['messages'][-1]['content']  # the repair says what was wrong
     assert all(c['model'] == 'z-ai/glm-5.3-flash' for c in calls)
     assert not calls[0]['messages'][0]['content'].endswith('citations.')  # no answer length cap by default
     capped = OpenRouter(Settings(_env_file=None, memory_mode='demo'), InMemoryGraph(), httpx.AsyncClient(transport=httpx.MockTransport(respond)))

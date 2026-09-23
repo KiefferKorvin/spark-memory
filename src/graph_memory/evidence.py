@@ -65,8 +65,9 @@ class ContextBuilder:
         self.token_budget = token_budget
 
     def build(self, needs, evidence):
-        # Round-robin across needs so one prolific branch cannot consume all context.
-        groups = [[e for e in evidence if n.id in e.information_need_ids] for n in needs]
+        # Round-robin across needs so one prolific branch cannot consume all context; within a need the most
+        # relevant evidence comes first, so truncation drops the weakest and synthesis reads the best first.
+        groups = [sorted((e for e in evidence if n.id in e.information_need_ids), key=lambda e: -e.relevance_score) for n in needs]
         ordered, seen = [], set()
         for index in range(max((len(g) for g in groups), default=0)):
             for group in groups:

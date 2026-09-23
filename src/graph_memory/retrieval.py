@@ -1,6 +1,7 @@
 import asyncio
 import heapq
 import itertools
+import re
 
 from .evidence import ContextBuilder, EvidenceCollector, SufficiencyEvaluator
 from .external import source_request
@@ -23,6 +24,13 @@ def preview(node, score=0, excerpt_tokens=0):
         # The character pre-cut bounds tokenizer work; 8 characters per token is a safe upper bound.
         view["excerpt"] = truncate(node.text[:excerpt_tokens * 8], excerpt_tokens)
     return view
+
+
+def answer_words(answer, context):
+    """Words of an answer without its inline evidence citations, which the length limit does not count."""
+    known = {e["id"] for e in context}
+    bare = re.sub(r"\s*\[([^\[\]\n]+)\]", lambda m: "" if all(p.strip() in known for p in m.group(1).split(",")) else m.group(0), answer)
+    return len(bare.split())
 
 
 def trace_preview(node, score=0, excerpt_tokens=0):
@@ -245,6 +253,19 @@ class RetrievalEngine:
                 return None
         return [d for d in await asyncio.gather(*map(one, sources)) if d]
 
+    async def shorten(self, payload, answer, context, limit, trace):
+        """Makes the length limit binding: one rewrite of an overlong answer. The draft stays when the rewrite
+        fails, cites nothing or is not shorter, so a long answer is never replaced by the raw-excerpt fallback."""
+        before = answer_words(answer.answer, context)
+        try:
+            short = await self.models.structured("synthesis", {**payload, "draft_answer": answer.answer}, Answer, trace.query_id)
+            short.evidence_ids = cited(short.answer, context)
+        except (ValueError, ProviderError):
+            short = None
+        after = answer_words(short.answer, context) if short and short.evidence_ids else before
+        await trace.emit("ANSWER_SHORTENED", limit=limit, words_before=before, words_after=min(after, before))
+        return short if after < before else answer
+
     async def query(self, request, trace):
         await trace.emit("QUERY_STARTED", query=request.query)
         decomposition = await self.models.structured("decomposition", {"query": request.query}, Decomposition, trace.query_id)
@@ -277,13 +298,15 @@ class RetrievalEngine:
         await trace.emit("ANSWER_GENERATION_STARTED")
         try:
             limit = request.answer_max_words or self.settings.answer_max_words
-            answer = await self.models.structured("synthesis", {"query": request.query,
-                "coverage": coverage.model_dump(), "evidence": context, **({"answer_max_words": limit} if limit else {})},
-                Answer, trace.query_id)
+            payload = {"query": request.query, "coverage": coverage.model_dump(), "evidence": context,
+                       **({"answer_max_words": limit} if limit else {})}
+            answer = await self.models.structured("synthesis", payload, Answer, trace.query_id)
             # Cited IDs are whatever known evidence the answer actually cites inline.
             answer.evidence_ids = cited(answer.answer, context)
             if context and not answer.evidence_ids:
                 raise ValueError("Answer must cite supplied evidence")
+            if limit and answer_words(answer.answer, context) > limit * 1.2:
+                answer = await self.shorten(payload, answer, context, limit, trace)
         except (ValueError, ProviderError):
             # Retrieval work is never discarded because synthesis failed: fall back to the original excerpts.
             await trace.emit("MODEL_FAILURE", operation="synthesis", fallback="original_excerpts")

@@ -59,7 +59,7 @@ class OpenRouter:
             raise ProviderError("Model input exceeds configured token budget")
         for attempt in range(self.settings.provider_retries + 1):
             started = time.monotonic()
-            usage, status, retryable = {}, "error", True
+            usage, status, retryable, reason = {}, "error", True, None
             try:
                 response = await self.client.post("https://openrouter.ai" + path, json=body,
                     headers={"Authorization": "Bearer " + self.settings.openrouter_api_key.get_secret_value(),
@@ -73,19 +73,20 @@ class OpenRouter:
                 status = "ok"
                 return result
             except (httpx.HTTPError, ValidationError, ValueError, KeyError, TypeError, ProviderError) as exc:
+                reason = f"{type(exc).__name__}: {exc}"[:200]
                 if attempt >= self.settings.provider_retries or not retryable:
                     raise ProviderError(f"{operation} failed after {attempt+1} attempt(s)") from exc
                 # Repair by asking the provider to satisfy the original schema; never salvage unvalidated JSON.
                 if "messages" in body:
                     body = {**body, "messages": [*body["messages"], {
-                        "role": "user", "content": "The preceding response was invalid. Return only valid JSON matching the supplied schema. For synthesis, copy evidence IDs exactly, without extra characters or suffixes, into both inline [id] citations and evidence_ids. Use only IDs present in the supplied evidence."}]}
+                        "role": "user", "content": f"The preceding response was invalid ({reason}). Return only valid JSON matching the supplied schema. For synthesis, copy evidence IDs exactly, without extra characters or suffixes, into both inline [id] citations and evidence_ids. Use only IDs present in the supplied evidence."}]}
             finally:
                 await self.repository.record("usage", str(uuid4()), {
                     "model": body["model"], "operation": operation, "query_id": query_id,
                     "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
                     "output_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)),
                     "estimated_cost": usage.get("cost"), "latency": time.monotonic()-started,
-                    "status": status, "attempt": attempt+1,
+                    "status": status, "attempt": attempt+1, **({"error": reason} if reason else {}),
                 })
             await asyncio.sleep(min(0.5 * 2**attempt, 4))
 
