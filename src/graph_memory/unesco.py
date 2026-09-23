@@ -172,10 +172,14 @@ async def embed_taxonomy(repository, models, settings, authority=None, batch=32)
         wanted = hashlib.sha256(f"{stamp}:{text}".encode()).hexdigest()[:24]
         if key != wanted:
             todo.append((node.id, wanted, text))
-    for start in range(0, len(todo), batch):
-        part = todo[start:start + batch]
-        vectors = await models.embed_batch([text for _, _, text in part])
-        await repository.set_ontology_embeddings([(i, key, v) for (i, key, _), v in zip(part, vectors)])
+    # Providers take 1.5-16 s per request, so batches go 8 at a time (4,500 concepts: minutes, not half an hour).
+    gate = asyncio.Semaphore(8)
+
+    async def one(part):
+        async with gate:
+            vectors = await models.embed_batch([text for _, _, text in part])
+            await repository.set_ontology_embeddings([(i, key, v) for (i, key, _), v in zip(part, vectors)])
+    await asyncio.gather(*(one(todo[start:start + batch]) for start in range(0, len(todo), batch)))
     await repository.record("taxonomy_embedding", authority, {"model": settings.embedding_model,
                                                                "dimensions": settings.embedding_dimensions, "concepts": len(concepts)})
     return {"authority": authority, "concepts": len(concepts), "embedded": len(todo)}
