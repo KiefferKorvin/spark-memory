@@ -35,8 +35,10 @@ def trace_preview(node, score=0, excerpt_tokens=0):
 
 
 class ExplorationSupervisor:
-    def __init__(self, settings, repository, models, trace, original_sources_only=False):
+    def __init__(self, settings, repository, models, trace, original_sources_only=False, question=None):
         self.settings, self.repository, self.models, self.trace = settings, repository, models, trace
+        # The user's own question: decomposition rewrites wording, so search and relevance also see the original.
+        self.question, self.question_vector = question, []
         self.collector = EvidenceCollector(repository, models, original_sources_only)
         self.frontier, self.visited, self.evidence = [], set(), {}
         self.branches, self.counter, self.explored = [], itertools.count(), 0
@@ -56,7 +58,7 @@ class ExplorationSupervisor:
         if not node:
             return
         try:
-            item = await self.collector.collect(node, need, self.trace.query_id)
+            item = await self.collector.collect(node, need, self.trace.query_id, self.question)
         except ProviderError:
             await self.trace.emit("MODEL_FAILURE", branch, operation="relevance")
             return
@@ -99,8 +101,7 @@ class ExplorationSupervisor:
             return
         # Root candidates come from the fulltext/vector indexes; imported taxonomy concepts qualify
         # only once content is attached to them, so empty thesaurus entries cannot absorb the budget.
-        candidates = await self.repository.candidates(need.description, vector, self.settings.candidate_limit,
-                                                      parent=branch.node_id)
+        candidates = await self.candidates(need, vector, branch.node_id)
         candidates = [(n, score) for n, score in candidates if (need.id, n.id) not in self.visited]
         excerpt = self.settings.navigation_excerpt_tokens
         await self.trace.emit("CANDIDATES_GENERATED", branch, nodes=[trace_preview(n, s, excerpt) for n, s in candidates])
@@ -154,12 +155,26 @@ class ExplorationSupervisor:
             await self.trace.emit("BACKTRACK", branch, reason="policy_dead_end")
         await self.trace.emit("BRANCH_COMPLETED", branch, status=branch.status)
 
+    async def candidates(self, need, vector, parent):
+        """Index candidates for the need and for the original question, merged before the limit."""
+        limit = self.settings.candidate_limit
+        found = await self.repository.candidates(need.description, vector, limit, parent=parent)
+        if not self.question or self.question.strip().casefold() == need.description.strip().casefold():
+            return found
+        best = {n.id: (n, score) for n, score in found}
+        for node, score in await self.repository.candidates(self.question, self.question_vector, limit, parent=parent):
+            if node.id not in best or score > best[node.id][1]:
+                best[node.id] = (node, score)
+        return sorted(best.values(), key=lambda pair: (-pair[1], pair[0].id))[:limit]
+
     async def explore(self, needs, starts=None):
         """Explore from the graph root, or from given start nodes per need (e.g. newly ingested sources).
 
         Each call gets its own node budget, so sources fetched after a first pass are always examined."""
         self.ceiling = self.explored + self.settings.max_total_nodes_explored
         vectors = {need.id: await self.models.embed(need.description, self.trace.query_id) for need in needs}
+        if self.question and not self.question_vector:
+            self.question_vector = await self.models.embed(self.question, self.trace.query_id)
         lookup = {n.id: n for n in needs}
         for need in needs:
             for node_id in (starts[need.id] if starts else [None]):
@@ -199,7 +214,7 @@ class RetrievalEngine:
         await trace.emit("SUFFICIENCY_CHECKED", coverage=result.model_dump())
         return result, context
 
-    async def search_external(self, need, limit, discovered, trace):
+    async def search_external(self, need, limit, discovered, trace, question=None):
         """Search online for one need; relevant sources are ingested concurrently. Returns new document IDs."""
         await trace.emit("EXTERNAL_SEARCH_STARTED", need=need.model_dump())
         try:
@@ -216,7 +231,7 @@ class RetrievalEngine:
             await trace.emit("EXTERNAL_SOURCE_FOUND", title=source.title, url=source.url, need_id=need.id,
                              retriever=source.metadata.get("retriever"))
             try:
-                relevant = await self.models.structured("relevance", {"information_need": need.model_dump(),
+                relevant = await self.models.structured("relevance", {"question": question, "information_need": need.model_dump(),
                     "text": truncate(source.text, 6000), "label": source.title}, Relevance, trace.query_id)
                 if not relevant.relevant:
                     await trace.emit("EXTERNAL_SOURCE_REJECTED", url=source.url, need_id=need.id, reason="not relevant")
@@ -235,7 +250,8 @@ class RetrievalEngine:
         decomposition = await self.models.structured("decomposition", {"query": request.query}, Decomposition, trace.query_id)
         needs = decomposition.information_needs
         await trace.emit("QUERY_DECOMPOSED", information_needs=[n.model_dump() for n in needs])
-        supervisor = ExplorationSupervisor(self.settings, self.repository, self.models, trace, request.original_sources_only)
+        supervisor = ExplorationSupervisor(self.settings, self.repository, self.models, trace, request.original_sources_only,
+                                           question=request.query)
         evidence = await supervisor.explore(needs)
         coverage, context = await self.coverage(needs, evidence, trace)
         if coverage.overall_status != "SUFFICIENT" and not (request.allow_external and self.external):
@@ -247,7 +263,8 @@ class RetrievalEngine:
                 break
             missing_ids = {c.information_need_id for c in coverage.coverage if c.status != "COVERED"}
             missing = [n for n in needs if n.id in missing_ids][:quota]
-            found = await asyncio.gather(*(self.search_external(n, max(1, quota // len(missing)), discovered, trace) for n in missing))
+            found = await asyncio.gather(*(self.search_external(n, max(1, quota // len(missing)), discovered, trace, request.query)
+                                           for n in missing))
             starts = {n.id: ids for n, ids in zip(missing, found) if ids}
             if not starts:
                 break

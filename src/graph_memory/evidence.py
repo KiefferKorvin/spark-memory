@@ -9,7 +9,7 @@ class EvidenceCollector:
         self.repository, self.models = repository, models
         self.original_sources_only = original_sources_only
 
-    async def collect(self, node, need, query_id):
+    async def collect(self, node, need, query_id, question=None):
         if node.kind not in ("Chunk", "Assertion", "Document") or not node.text:
             return None
         if node.kind == "Document" and not node.retrieval_leaf:
@@ -24,7 +24,7 @@ class EvidenceCollector:
         if not provenance["sources"]:
             return None
         assessment = await self.models.structured("relevance", {
-            "information_need": need.model_dump(), "text": node.text, "label": node.label,
+            "question": question, "information_need": need.model_dump(), "text": node.text, "label": node.label,
         }, Relevance, query_id)
         if not assessment.relevant:
             return None

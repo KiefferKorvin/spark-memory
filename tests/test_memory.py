@@ -394,6 +394,29 @@ async def test_navigation_request_shortens_excerpts_to_fit_budget():
     assert all(0 < token_count(c["excerpt"]) < 80 and excerpt.startswith(c["excerpt"]) for c in shortened["state"]["candidate_children"])
 
 
+async def test_original_question_reaches_candidate_search_and_relevance():
+    from graph_memory.models import QueryRequest
+    class Repo(InMemoryGraph):
+        queries = []
+        async def candidates(self, query, vector, limit, parent=None, kind=None):
+            self.queries.append((query, bool(vector)))
+            return await super().candidates(query, vector, limit, parent, kind)
+    class Models(DemoModels):
+        relevance = []
+        async def structured(self, operation, payload, schema, query_id=None):
+            if operation == "relevance":
+                self.relevance.append(payload)
+            return await super().structured(operation, payload, schema, query_id)
+    memory = Memory(settings(), Repo(), Models(), DemoExternal())
+    await seed(memory)
+    Repo.queries.clear()
+    question = "How do piano and harmony connect?"  # the demo decomposition rewrites it into two needs
+    result = await memory.query(QueryRequest(query=question, allow_external=False))
+    assert question not in [n["description"] for n in result["information_needs"]]
+    assert (question, True) in Repo.queries  # searched with its own embedding as well as each need
+    assert Models.relevance and all(p["question"] == question for p in Models.relevance)
+
+
 async def test_external_sources_are_explored_with_fresh_budget():
     # The first pass exhausts its node budget; newly ingested sources are still examined directly.
     memory = make_memory(max_total_nodes_explored=2)
