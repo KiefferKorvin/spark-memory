@@ -116,7 +116,8 @@ function index(s) {
 
 function stages(s, {methods}) {
   const q = s.questions.length, total = q * methods.length, p = s.progress.ingest || {};
-  const ok = s.ingested.filter(r => !r.error).length, failed = new Set(s.ingested.filter(r => r.error).map(r => r.doc_id)).size;
+  const done = new Set(s.ingested.filter(r => !r.error).map(r => r.doc_id));
+  const ok = done.size, failed = new Set(s.ingested.filter(r => r.error && !done.has(r.doc_id)).map(r => r.doc_id)).size;  // a retried success is not a failure
   const docs = s.corpus.documents || p.total || 0;
   const elapsed = p.started ? ((p.finished || s.updated) - p.started) : 0;
   const rate = ok && elapsed ? elapsed / ok : null;
