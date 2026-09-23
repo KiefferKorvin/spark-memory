@@ -52,6 +52,7 @@ tr.q:focus-visible td { outline: 2px solid var(--accent); }
 .ans h3 { margin: 0 0 6px; font-size: 13px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .ans p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .judge { margin-top: 8px; font-size: 12px; color: var(--muted); border-top: 1px dashed var(--line); padding-top: 6px; }
+.judge ul { margin: 4px 0 0; padding-left: 18px; }
 .tag { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; }
 .log { font: 12px/1.5 ui-monospace, Consolas, monospace; max-height: 260px; overflow: auto; white-space: pre-wrap; margin: 0; }
 .err { color: var(--loss); }
@@ -88,8 +89,8 @@ tr.q:focus-visible td { outline: 2px solid var(--accent); }
   </section>
 </main>
 <script>
-const METHODS = ["closed_book", "bm25_rag", "dense_rag", "oracle_rag", "kg_memory"];
-const LABELS = {closed_book: "Closed book", bm25_rag: "BM25 RAG", dense_rag: "Dense RAG", oracle_rag: "Oracle RAG (gold docs)", kg_memory: "KG memory"};
+const METHODS = ["closed_book", "bm25_rag", "dense_rag", "oracle_rag", "kg_memory", "kg_context"];
+const LABELS = {closed_book: "Closed book", bm25_rag: "BM25 RAG", dense_rag: "Dense RAG", oracle_rag: "Oracle RAG (gold docs)", kg_memory: "KG memory", kg_context: "KG context (arena template)"};
 const run = new URLSearchParams(location.search).get("run") || "preview";
 const open = new Set();
 let state = null, lastUpdated = null, domainFilter = "all";
@@ -98,18 +99,19 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "
 const pct = (a, b) => b ? (100 * a / b).toFixed(0) + "%" : "–";
 const money = x => "$" + (x || 0).toFixed(x >= 1 ? 2 : 4);
 const dur = s => s < 90 ? s.toFixed(0) + "s" : s < 5400 ? (s / 60).toFixed(0) + " min" : (s / 3600).toFixed(1) + " h";
-const label = m => `<span class="method ${m === "kg_memory" ? "kg" : ""}">${esc(LABELS[m] || m)}</span>`;
+const label = m => `<span class="method ${m.startsWith("kg_") ? "kg" : ""}">${esc(LABELS[m] || m)}</span>`;
 const mean = xs => xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null;
 const words = s => (s || "").split(/\s+/).filter(Boolean).length;
 
 function verdict(j) { return !j ? null : j.winner === "tie" ? "T" : j.winner === "LFRQA" ? "L" : "W"; }
 
 function index(s) {
-  const ans = {}, jud = {};
+  const ans = {}, jud = {}, gr = {};
   for (const a of s.answers) ans[a.method + "|" + a.qid] = a;
   for (const j of s.judgments) jud[j.method + "|" + j.qid] = j;
+  for (const g of s.grounding || []) gr[g.method + "|" + g.qid] = g;
   const methods = METHODS.filter(m => s.config.methods ? s.config.methods.includes(m) : true);
-  return {ans, jud, methods};
+  return {ans, jud, gr, methods};
 }
 
 function stages(s, {methods}) {
@@ -124,31 +126,40 @@ function stages(s, {methods}) {
     <b>${done}</b> <span class="muted">/ ${of}</span><div class="bar"><i style="width:${of ? 100 * done / of : 0}%;background:${color}"></i></div>
     <div class="muted">${sub}</div></div>`;
   const running = methods.flatMap(m => (s.running[m] || []).map(qid => m)).length;
+  const mapped = s.ingested.filter(r => r.extracted != null), skips = {};
+  mapped.forEach(r => Object.entries(r.skips || {}).forEach(([k, n]) => skips[k] = (skips[k] || 0) + n));
+  const extracted = mapped.reduce((t, r) => t + r.extracted, 0), skipped = Object.values(skips).reduce((t, n) => t + n, 0);
+  const provisional = mapped.reduce((t, r) => t + (r.provisional || 0), 0);
+  const mapping = mapped.length ? card("Concept mapping", extracted - skipped, extracted,
+    [`linked${provisional ? `, ${provisional} provisional` : ""}`, ...Object.entries(skips).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${esc(k)} ${n}`)].join(" · "), "var(--kg)") : "";
   return card("1 · Subset", q, q, `${docs} documents (${s.corpus.gold ?? "–"} gold) · ${domains || "preparing"}`) +
-    card("2 · KG ingestion", ok, docs, `${failed ? `<span class="err">${failed} failed</span> · ` : ""}${rate ? rate.toFixed(1) + " s/doc wall" : ""}${eta}${p.cost != null ? " · " + money(p.cost) + ` · ${p.calls} calls` : ""}`, "var(--kg)") +
+    card("2 · KG ingestion", ok, docs, `${failed ? `<span class="err">${failed} failed</span> · ` : ""}${rate ? rate.toFixed(1) + " s/doc wall" : ""}${eta}${p.cost != null ? " · " + money(p.cost) + ` · ${p.calls} calls` : ""}`, "var(--kg)") + mapping +
     card("3 · Answers", s.answers.length, total, `${running} in flight`) +
     card("4 · Judged vs LFRQA", s.judgments.length, total, `judge ${esc(s.config.judge || "")}`, "var(--win)");
 }
 
 function board(s, {ans, jud, methods}) {
+  const inDomain = r => domainFilter === "all" || s.questions.find(q => q.qid === r.qid)?.domain === domainFilter;
   const rows = methods.map(m => {
-    const js = s.judgments.filter(j => j.method === m && (domainFilter === "all" || s.questions.find(q => q.qid === j.qid)?.domain === domainFilter));
+    const js = s.judgments.filter(j => j.method === m && inDomain(j));
+    const supported = mean((s.grounding || []).filter(g => g.method === m && g.supported != null && inDomain(g)).map(g => g.supported));
     const c = {W: 0, T: 0, L: 0}; js.forEach(j => c[verdict(j)]++);
     const as = s.answers.filter(a => a.method === m);
     const recall = mean(as.filter(a => a.gold_recall != null).map(a => a.gold_recall));
     const cost = as.reduce((t, a) => t + (a.cost || 0), 0);
     const errors = as.filter(a => a.error).length;
-    return {m, c, n: js.length, recall, cost, errors, words: mean(as.map(a => words(a.pred))), secs: mean(as.map(a => a.seconds || 0))};
+    return {m, c, n: js.length, recall, supported, cost, errors, words: mean(as.map(a => words(a.pred))), secs: mean(as.map(a => a.seconds || 0))};
   }).sort((a, b) => (b.n ? (b.c.W + b.c.T) / b.n : -1) - (a.n ? (a.c.W + a.c.T) / a.n : -1));
   const refWords = mean(s.questions.map(q => words(q.reference)));
   return `<tr><th>Method</th><th class="num">Win</th><th class="num">Win+tie</th><th>Win · tie · loss</th><th class="num">Judged</th>
-    <th class="num">Gold recall</th><th class="num">Avg words</th><th class="num">Avg s</th><th class="num">Answer cost</th><th class="num">Errors</th></tr>` +
+    <th class="num">Gold recall</th><th class="num" title="Mean share of answer claims supported by the passages the method used">Supported</th><th class="num">Avg words</th><th class="num">Avg s</th><th class="num">Answer cost</th><th class="num">Errors</th></tr>` +
     rows.map(r => `<tr><td>${label(r.m)}</td><td class="num">${pct(r.c.W, r.n)}</td><td class="num"><b>${pct(r.c.W + r.c.T, r.n)}</b></td>
       <td><div class="stack">${["W", "T", "L"].map(k => `<i class="${k}" style="width:${r.n ? 100 * r.c[k] / r.n : 0}%" title="${k} ${r.c[k]}"></i>`).join("")}</div></td>
       <td class="num">${r.n}</td><td class="num">${r.recall == null ? "–" : (100 * r.recall).toFixed(0) + "%"}</td>
+      <td class="num">${r.supported == null ? "–" : (100 * r.supported).toFixed(0) + "%"}</td>
       <td class="num">${r.words == null ? "–" : r.words.toFixed(0)}</td><td class="num">${r.secs == null ? "–" : r.secs.toFixed(1)}</td>
       <td class="num">${money(r.cost)}</td><td class="num ${r.errors ? "err" : ""}">${r.errors}</td></tr>`).join("") +
-    `<tr><td class="muted">LFRQA reference</td><td colspan="5"></td><td class="num muted">${refWords == null ? "–" : refWords.toFixed(0)}</td><td colspan="3"></td></tr>`;
+    `<tr><td class="muted">LFRQA reference</td><td colspan="6"></td><td class="num muted">${refWords == null ? "–" : refWords.toFixed(0)}</td><td colspan="3"></td></tr>`;
 }
 
 function domains(s, {jud, methods}) {
@@ -168,18 +179,20 @@ function cell(s, m, q, {ans, jud}) {
   return `<span class="chip P">·</span>`;
 }
 
-function detail(s, q, {ans, jud, methods}) {
+function detail(s, q, {ans, jud, gr, methods}) {
   const blocks = methods.map(m => {
-    const a = ans[m + "|" + q.qid], j = jud[m + "|" + q.qid];
+    const a = ans[m + "|" + q.qid], j = jud[m + "|" + q.qid], g = gr[m + "|" + q.qid];
     if (!a) return `<div class="ans"><h3>${label(m)} <span class="tag">pending</span></h3></div>`;
     const tags = [a.gold_recall != null ? `gold recall ${(100 * a.gold_recall).toFixed(0)}%` : null, `${a.seconds}s`, a.cost ? money(a.cost) : null,
       a.coverage ? `coverage ${a.coverage}` : null, a.nodes_explored != null ? `${a.nodes_explored} nodes` : null,
-      a.calls ? `${a.calls} calls` : null, a.fallback ? "synthesis fallback" : null].filter(Boolean);
+      a.calls ? `${a.calls} calls` : null, a.fallback ? "synthesis fallback" : null,
+      g && g.supported != null ? `supported ${(100 * g.supported).toFixed(0)}%` : null].filter(Boolean);
+    const unsupported = g && g.unsupported && g.unsupported.length ? `<div class="judge">Unsupported by its passages:<ul>${g.unsupported.map(c => `<li>${esc(c)}</li>`).join("")}</ul></div>` : "";
     const retrieved = a.retrieved ? `<div class="muted">retrieved: ${a.retrieved.map(d => q.gold.includes(d) ? `<b>${esc(d)}</b>` : esc(d)).join(", ") || "none"}</div>` : "";
     const needs = a.needs ? `<div class="muted">needs: ${a.needs.map(esc).join(" | ")}</div>` : "";
     return `<div class="ans"><h3>${label(m)} ${j ? `<span class="chip ${verdict(j)}">${verdict(j)}</span>` : ""} ${tags.map(t => `<span class="tag">${esc(t)}</span>`).join(" ")}</h3>
       ${a.error ? `<div class="err">${esc(a.error)}</div>` : ""}<p>${esc(a.pred)}</p>${needs}${retrieved}
-      ${j ? `<div class="judge">Judge: ${esc(j.thinking)}</div>` : ""}</div>`;
+      ${j ? `<div class="judge">Judge: ${esc(j.thinking)}</div>` : ""}${unsupported}</div>`;
   });
   return `<tr class="detail"><td colspan="${methods.length + 2}"><div class="answers">
     <div class="ans"><h3>LFRQA reference <span class="tag">gold: ${q.gold.map(esc).join(", ")}</span></h3><p>${esc(q.reference)}</p></div>${blocks.join("")}</div></td></tr>`;
@@ -211,7 +224,7 @@ function render() {
 
 function tick() {
   if (!state) return;
-  const age = Date.now() / 1000 - state.updated, active = !["done", "failed"].includes(state.phase);
+  const age = Date.now() / 1000 - state.updated, active = !["done", "failed", "stopped"].includes(state.phase);
   $("dot").className = "dot" + (active && age < 15 ? " on" : "");
   $("ago").textContent = active ? `updated ${dur(Math.max(age, 0))} ago` + (age > 60 ? " (runner stopped?)" : "") : `finished ${new Date(state.updated * 1000).toLocaleString()}`;
 }

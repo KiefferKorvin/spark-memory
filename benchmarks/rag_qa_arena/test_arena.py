@@ -1,8 +1,12 @@
 """Offline checks of the ported benchmark logic: python benchmarks/rag_qa_arena/test_arena.py"""
+import asyncio
 import tempfile
 from pathlib import Path
 
-from arena import BM25, NO_ANSWER, mine, parse_vote, passages, process_response, without_citations
+import httpx
+
+from arena import (BM25, NO_ANSWER, OpenRouter, Run, SpendCap, context_texts, kg_passages, mine, parse_grounding,
+                   parse_vote, passages, process_response, reset_refusal, watch_spend_cap, without_citations)
 
 assert process_response("<thinking>short</thinking>\nThe answer.") == "The answer."
 assert process_response("Thought: x Answer: The answer.") == "The answer."
@@ -24,4 +28,66 @@ with tempfile.TemporaryDirectory() as root:
     assert {pid for _, pid, _ in heaps[0]} == {"1", "3"}  # Gold excluded, unrelated doc never mined.
 
 assert BM25(docs).top("photosynthesis light", 1) == [0]
+
+# --reset-graph never wipes the live graph: its .env URI (any spelling of localhost) or port 7687, bolt's default.
+LIVE = "bolt://localhost:7687"
+assert reset_refusal("bolt://localhost:7688", LIVE) is None
+for uri in ("bolt://127.0.0.1:7687", "neo4j://localhost", "bolt://db.example:7687"):
+    assert reset_refusal(uri, LIVE), uri
+assert reset_refusal("bolt://127.0.0.1:7690", "bolt://localhost:7690")
+
+# kg_context: the final context split into 100-word passages, first k; recall only counts documents behind them.
+context = [{"text": " ".join(["a"] * 150), "provenance": {"sources": [{"metadata": {}}, {"metadata": {"bench_doc_id": "d1"}}]}},
+           {"text": "b c", "provenance": {"sources": [{"metadata": {"bench_doc_id": "d2"}}]}},
+           {"text": "web page", "provenance": {"sources": [{"uri": "https://x"}]}}]
+cut = kg_passages(context_texts(context), 2)
+assert [(p["doc"], len(p["text"].split())) for p in cut] == [("d1", 100), ("d1", 50)]
+assert [p["doc"] for p in kg_passages(context_texts(context), 5)] == ["d1", "d1", "d2", None]
+
+share, unsupported = parse_grounding('```json\n{"claims": [{"claim": "A", "supported": true}, {"claim": "B", "supported": false},'
+                                     ' {"claim": "C", "supported": "yes"}, {"claim": " ", "supported": false}]}\n```')
+assert (share, unsupported) == (1 / 3, ["B", "C"])  # Only a literal true counts; blank claims are ignored.
+assert parse_grounding('{"claims": []}') == (None, [])
+try:
+    parse_grounding("I cannot judge this.")
+    raise AssertionError("malformed verdict must raise so a rerun retries it")
+except ValueError:
+    pass
+
+
+async def spend_cap_stops_the_run():
+    calls = []
+
+    def respond(status, body):
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(status, json=body)
+        return httpx.MockTransport(handler)
+    # Baselines and judges: a spend-cap refusal raises at once instead of retrying or logging per item.
+    client = OpenRouter("key", respond(403, {"error": {"message": "Key limit exceeded", "code": 403}}))
+    try:
+        await client.chat("m", [], 5)
+        raise AssertionError("spend cap must be fatal")
+    except SpendCap:
+        assert len(calls) == 1
+    # A moderation 403 is an ordinary per-item failure.
+    client = OpenRouter("key", respond(403, {"error": {"message": "Input flagged by moderation", "code": 403}}))
+    try:
+        await client.chat("m", [], 5)
+    except SpendCap:
+        raise AssertionError("moderation refusal is not a spend cap")
+    except RuntimeError:
+        pass
+    # The graph memory's own client halts the run through a response hook, logging once.
+    with tempfile.TemporaryDirectory() as root:
+        run = Run(Path(root) / "r", {})
+        memory_client = httpx.AsyncClient(transport=respond(402, {"error": {"message": "Insufficient credits"}}))
+        watch_spend_cap(memory_client, run)
+        for _ in range(2):
+            await memory_client.post("https://openrouter.ai/api/v1/chat/completions", json={})
+        assert run.halted and run.state["phase"] == "stopped"
+        assert sum("STOPPED" in m for _, m in run.state["log"]) == 1
+        await memory_client.aclose()
+
+asyncio.run(spend_cap_stops_the_run())
 print("ok")

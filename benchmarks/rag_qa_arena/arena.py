@@ -11,6 +11,14 @@ so these distractors are deliberately hard for it). Every stage is cached in run
 From memory/:
     .venv\\Scripts\\python benchmarks\\rag_qa_arena\\arena.py --run preview
     .venv\\Scripts\\python -m http.server 8777 --directory benchmarks\\rag_qa_arena   # /viewer.html?run=preview
+
+--reset-graph   wipes the benchmark graph (in batches) and the run's ingested.jsonl before ingestion; initialize()
+                then re-imports UNESCO. Refused for NEO4J_URI of memory\\.env and for port 7687 (the live graph).
+--skip-judge    answers and retrieval metrics only; a later run without the flag judges whatever is missing.
+ARENA_OPENROUTER_API_KEY (environment or memory\\.env) replaces OPENROUTER_API_KEY for baselines, judges and the
+                graph memory, so benchmarks cannot exhaust the live app's spend cap. state.json records which was used.
+A spend-cap refusal (HTTP 402, or 403 "Key limit exceeded") stops the run: one log line, no new work, state saved,
+exit code 2. Rows in flight when it hit are not recorded; cached rows stay valid, so a rerun resumes.
 """
 import argparse
 import asyncio
@@ -24,8 +32,10 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
+from dotenv import dotenv_values
 
 HERE = Path(__file__).resolve().parent
 MEMORY = HERE.parents[1]
@@ -35,7 +45,8 @@ from graph_memory.models import IngestRequest, QueryRequest  # noqa: E402
 from graph_memory.service import Memory  # noqa: E402
 
 DOMAINS = ["lifestyle", "recreation", "science", "technology", "writing"]
-METHODS = ["closed_book", "bm25_rag", "dense_rag", "oracle_rag", "kg_memory"]
+METHODS = ["closed_book", "bm25_rag", "dense_rag", "oracle_rag", "kg_memory", "kg_context"]
+GROUNDED = ["bm25_rag", "dense_rag", "oracle_rag", "kg_memory", "kg_context"]  # methods that answer from passages
 NO_ANSWER = "I couldn't find an answer."
 STOP = set("a an the of to in on for and or is are was were be been it its this that with as by at from how what why "
            "when where which who whom do does did can could should would will i you my your me we our not no if so".split())
@@ -161,6 +172,39 @@ def passages(corpus):
     return result
 
 
+def context_texts(context):
+    """Text and benchmark document id (None for non-corpus sources) of each graph-memory final-context item."""
+    return [{"doc": next((s["metadata"]["bench_doc_id"] for s in e["provenance"].get("sources", [])
+                          if s.get("metadata", {}).get("bench_doc_id")), None), "text": e["text"]} for e in context]
+
+
+def kg_passages(texts, k):
+    """kg_context input: the graph memory's final context cut like the baselines' corpus, first k passages."""
+    return passages([{"id": t["doc"], "text": t["text"]} for t in texts])[:k]
+
+
+# --- Groundedness: an extra measure; the arena's pairwise judge never sees the sources ---
+GROUNDING = ("You check an answer against the passages it was written from. Split the answer into its distinct factual "
+             "claims (advice, hedges and restatements of the question are not claims). For each claim decide whether the "
+             "passages state or directly imply it; general knowledge that the passages lack is unsupported. "
+             'Return JSON only: {"claims": [{"claim": "...", "supported": true}]}')
+
+
+def grounding_input(chosen, answer):
+    return "".join(f"<passage{i+1}>\n{p['text']}\n</passage{i+1}>\n" for i, p in enumerate(chosen)) + f"\n<answer>\n{answer}\n</answer>"
+
+
+def parse_grounding(text):
+    """(supported share, unsupported claims); the share is None when the answer makes no claims.
+    Malformed output raises, so the item is retried by a rerun instead of being recorded."""
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        raise ValueError("no JSON object in grounding verdict")
+    claims = [c for c in json.loads(match.group(0))["claims"] if str(c.get("claim", "")).strip()]
+    supported = [c.get("supported") is True for c in claims]
+    return (sum(supported) / len(claims) if claims else None), [c["claim"] for c, ok in zip(claims, supported) if not ok]
+
+
 class BM25:
     def __init__(self, texts):
         self.docs = [Counter(tokens(t)) for t in texts]
@@ -177,9 +221,29 @@ class BM25:
 
 
 # --- Model access for baselines and judge (the KG pipeline uses its own client) ---
+class SpendCap(RuntimeError):
+    """The key's spend cap or credits are exhausted: fatal for the whole run, not for one item."""
+
+
+def spend_cap(status, text):
+    # 403 also covers moderation refusals; only budget wording is fatal.
+    return status == 402 or status == 403 and any(w in text.lower() for w in ("limit", "credit"))
+
+
+def watch_spend_cap(client, run):
+    """Halts the run when the graph memory's own OpenRouter client meets the spend cap; the pipeline itself
+    absorbs provider errors (navigation fallback, skipped concepts), so they never reach the harness."""
+    async def hook(response):
+        if response.status_code in (402, 403):
+            await response.aread()
+            if spend_cap(response.status_code, response.text):
+                run.halt(f"graph memory: HTTP {response.status_code}: {response.text[:120]}")
+    client.event_hooks["response"].append(hook)
+
+
 class OpenRouter:
-    def __init__(self, key):
-        self.http = httpx.AsyncClient(base_url="https://openrouter.ai/api/v1", timeout=180,
+    def __init__(self, key, transport=None):
+        self.http = httpx.AsyncClient(base_url="https://openrouter.ai/api/v1", timeout=180, transport=transport,
                                       headers={"Authorization": f"Bearer {key}", "X-Title": "RAG-QA Arena benchmark"})
 
     async def post(self, path, body, pace=None):
@@ -192,6 +256,8 @@ class OpenRouter:
                 if response.status_code == 200 and "error" not in (obj := response.json()):
                     return obj
                 error = f"HTTP {response.status_code}: {response.text[:200]}"
+                if spend_cap(response.status_code, response.text):
+                    raise SpendCap(error)
                 if response.status_code in (400, 401, 402, 403, 404):
                     break
             except (httpx.HTTPError, ValueError) as exc:
@@ -233,8 +299,15 @@ class Run:
         path.mkdir(parents=True, exist_ok=True)
         self.state = {"run": path.name, "config": config, "phase": "starting", "started": time.time(), "log": [],
                       "progress": {}, "questions": [], "corpus": {}, "ingested": [], "answers": [], "judgments": [],
-                      "running": {m: [] for m in METHODS}}
-        self.dirty = True
+                      "grounding": [], "running": {m: [] for m in METHODS}}
+        self.dirty, self.halted = True, None
+
+    def halt(self, reason):
+        """Spend cap: stop scheduling work. Rows finishing after this were in flight when it hit and may be
+        degraded (e.g. navigation fallback), so callers drop them and a rerun redoes them."""
+        if not self.halted:
+            self.halted, self.state["phase"] = reason, "stopped"
+            self.log(f"STOPPED, spend cap reached: {reason}. Cached rows stay valid; rerun to resume.")
 
     def rows(self, name):
         path = self.dir / f"{name}.jsonl"
@@ -281,7 +354,28 @@ def without_citations(answer, ids):
     return re.sub(r"\s*\[([^\[\]\n]+)\]", drop, answer).strip()
 
 
+def reset_refusal(uri, live_uri):
+    """Why --reset-graph must not wipe `uri`, or None. Port 7687 is the live stack's and bolt's default."""
+    def endpoint(value):
+        parts = urlsplit(value)
+        host = parts.hostname or "localhost"
+        return ("localhost" if host in ("127.0.0.1", "::1") else host), parts.port or 7687
+    if endpoint(uri) == endpoint(live_uri):
+        return f"--reset-graph refuses {uri}: it is NEO4J_URI of memory\\.env (the live graph)"
+    if endpoint(uri)[1] == 7687:
+        return f"--reset-graph refuses {uri}: port 7687 belongs to the live graph"
+    return None
+
+
+async def reset_graph(repository):
+    """Deletes every node and relationship in batches, so no single transaction holds the whole graph."""
+    while (await repository.run("MATCH (n) WITH n LIMIT 5000 DETACH DELETE n RETURN count(*) AS deleted"))[0]["deleted"]:
+        pass
+
+
 async def main(args):
+    if args.reset_graph and (refusal := reset_refusal(args.neo4j_uri, Settings(_env_file=MEMORY / ".env").neo4j_uri)):
+        raise SystemExit(refusal)
     config = {k: str(v) for k, v in vars(args).items()}
     run = Run(HERE / "runs" / args.run, config)
     saver = asyncio.create_task(run.autosave())
@@ -295,20 +389,34 @@ async def main(args):
                            "by_domain": Counter(d["domain"] for d in corpus)}
 
     overrides = dict(kv.split("=", 1) for kv in args.kg_setting)
+    # A dedicated benchmark key keeps a runaway run from exhausting the live app's spend cap.
+    key = os.environ.get("ARENA_OPENROUTER_API_KEY") or dotenv_values(MEMORY / ".env").get("ARENA_OPENROUTER_API_KEY")
+    if key:
+        overrides["openrouter_api_key"] = key
     settings = Settings(_env_file=MEMORY / ".env", neo4j_uri=args.neo4j_uri, neo4j_password=args.neo4j_password,
                         external_retrievers="", **overrides)
     run.state["config"].update(answer_model=settings.synthesis_model, semantic_model=settings.semantic_model,
                                embedding_model=settings.embedding_model, navigation_model=settings.navigation_model,
+                               api_key_source="ARENA_OPENROUTER_API_KEY" if key else "OPENROUTER_API_KEY",
                                kg={k: getattr(settings, k) for k in ("max_total_nodes_explored", "max_depth", "max_parallel_branches",
                                    "max_children_per_decision", "candidate_limit", "context_token_budget", "query_timeout_seconds")})
     client = OpenRouter(settings.openrouter_api_key.get_secret_value())
     memory = Memory.from_settings(settings)
-    run.log("initializing graph memory (Neo4j schema, UNESCO import)")
-    await memory.initialize()
+    watch_spend_cap(memory.models.client, run)
     try:
+        if args.reset_graph:
+            run.log(f"resetting the benchmark graph at {args.neo4j_uri}")
+            await reset_graph(memory.repository)
+            (run.dir / "ingested.jsonl").unlink(missing_ok=True)
+        run.log("initializing graph memory (Neo4j schema, UNESCO import)")
+        await memory.initialize()
         await ingest(args, run, memory, corpus)
-        await evaluate(args, run, memory, client, settings, questions, corpus)
-        run.phase("done")
+        if not run.halted:
+            await evaluate(args, run, memory, client, settings, questions, corpus)
+        if not run.halted:
+            run.phase("done")
+    except SpendCap as exc:
+        run.halt(str(exc))
     except Exception as exc:
         run.log(f"FAILED: {type(exc).__name__}: {exc}")
         run.state["phase"] = "failed"
@@ -318,6 +426,7 @@ async def main(args):
         run.save()
         await client.http.aclose()
         await memory.close()
+    return 2 if run.halted else 0
 
 
 async def ingest(args, run, memory, corpus):
@@ -327,6 +436,8 @@ async def ingest(args, run, memory, corpus):
 
     async def one(doc):
         async with gate:
+            if run.halted:
+                return
             started = time.monotonic()
             try:
                 result = await memory.ingest(IngestRequest(text=doc["text"], source_type="api",
@@ -336,10 +447,14 @@ async def ingest(args, run, memory, corpus):
                        "unclassified": len(result.get("unclassified_concepts") or [])}
             except Exception as exc:
                 row = {"doc_id": doc["id"], "error": f"{type(exc).__name__}: {exc}"[:300]}
-                run.log(f"ingest failed {doc['id']}: {row['error']}")
-            run.add("ingested", {**row, "seconds": round(time.monotonic() - started, 1), "words": len(doc["text"].split())})
+                if not run.halted:
+                    run.log(f"ingest failed {doc['id']}: {row['error']}")
+            if not run.halted:
+                run.add("ingested", {**row, "seconds": round(time.monotonic() - started, 1), "words": len(doc["text"].split())})
 
     for _ in range(2):  # One in-run retry for transient provider failures.
+        if run.halted:
+            break
         done = {r["doc_id"] for r in run.state["ingested"] if "error" not in r}
         todo = [d for d in corpus if d["id"] not in done]
         if todo:  # A resumed run with nothing left keeps no timing, so the viewer shows no bogus rate.
@@ -374,23 +489,21 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
         prompt = answer_template.replace("{x.passages}", "".join(f"<passage{i+1}>\n{p['text']}\n</passage>\n" for i, p in enumerate(chosen)))
         text, cost = await client.chat(settings.synthesis_model, [{"role": "user", "content": prompt.replace("{x.question}", q["question"])}],
                                        args.answer_tokens, settings.openrouter_options)
-        return {"pred": process_response(text), "cost": cost, "retrieved": list(dict.fromkeys(p["doc"] for p in chosen))}
+        return {"pred": process_response(text), "cost": cost, "retrieved": [d for d in dict.fromkeys(p["doc"] for p in chosen) if d]}
 
     async def closed_book(q):
         text, cost = await client.chat(settings.synthesis_model, [{"role": "user", "content": CLOSED_BOOK.format(q=q["question"])}],
                                        args.answer_tokens, settings.openrouter_options)
         return {"pred": process_response(text), "cost": cost}
 
-    async def bm25_rag(q):
-        return await rag(q, [psgs[i] for i in bm25.top(q["question"], args.passages)])
-
-    async def dense_rag(q):
+    def dense(q):
         qv = qvectors[q["qid"]]
-        ranked = sorted(range(len(psgs)), key=lambda i: -sum(a * b for a, b in zip(qv, vectors[i])))
-        return await rag(q, [psgs[i] for i in ranked[:args.passages]])
+        return sorted(range(len(psgs)), key=lambda i: -sum(a * b for a, b in zip(qv, vectors[i])))[:args.passages]
 
-    async def oracle_rag(q):
-        return await rag(q, [{"doc": g, "text": texts[g]} for g in q["gold"]])
+    # Deterministic, so the grounding judge sees the same passages for cached answers.
+    select = {"bm25_rag": lambda q: [psgs[i] for i in bm25.top(q["question"], args.passages)],
+              "dense_rag": lambda q: [psgs[i] for i in dense(q)],
+              "oracle_rag": lambda q: [{"doc": g, "text": texts[g]} for g in q["gold"]]}
 
     async def kg_memory(q):
         result = await memory.query(QueryRequest(query=q["question"], allow_external=False))
@@ -404,40 +517,80 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
         return {**extra, "pred": without_citations(result["answer"], {e["id"] for e in context}),
                 "retrieved": [d for d in dict.fromkeys(docs) if d], "fallback": result["answer"].startswith("Synthesis unavailable"),
                 "needs": [n["description"] for n in result["information_needs"]], "coverage": result["coverage"]["overall_status"],
-                "nodes_explored": result["nodes_explored"], "evidence": len(result["evidence"]), "context": len(context)}
+                "nodes_explored": result["nodes_explored"], "evidence": len(result["evidence"]), "context": len(context),
+                "context_texts": context_texts(context)}
 
-    answerers = {"closed_book": closed_book, "bm25_rag": bm25_rag, "dense_rag": dense_rag, "oracle_rag": oracle_rag, "kg_memory": kg_memory}
+    async def kg_texts(qid):
+        """The graph memory's final context: from its kg_memory row, or (older rows) its persisted query record.
+        Never a second graph query, so kg_context differs from kg_memory only in how the answer is written."""
+        row = answered.get(("kg_memory", qid))
+        if not row or row.get("status") != "completed":
+            raise ValueError("no completed kg_memory answer for this question")
+        if "context_texts" in row:
+            return row["context_texts"]
+        record = await memory.repository.read_record("query", row["query_id"])
+        if not record or "context" not in record:
+            raise ValueError(f"query {row['query_id']} is not in the benchmark graph")
+        return context_texts(record["context"])
+
+    async def kg_context(q):
+        return await rag(q, kg_passages(await kg_texts(q["qid"]), args.passages))
+
+    async def used(method, q):
+        """The passages an answer was written from."""
+        if method in select:
+            return select[method](q)
+        found = await kg_texts(q["qid"])
+        return kg_passages(found, args.passages) if method == "kg_context" else found
+
+    answerers = {"closed_book": closed_book, "kg_memory": kg_memory, "kg_context": kg_context,
+                 **{m: (lambda pick: lambda q: rag(q, pick(q)))(pick) for m, pick in select.items()}}
     methods = [m for m in METHODS if m in args.methods]
-    for name in ("answers", "judgments"):
+    for name in ("answers", "judgments", "grounding"):
         run.state[name] = [r for r in run.rows(name) if r["method"] not in args.redo]
         if args.redo:
             (run.dir / f"{name}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in run.state[name]), encoding="utf-8")
     answered = {(r["method"], r["qid"]): r for r in run.state["answers"]}
     judged = {(r["method"], r["qid"]) for r in run.state["judgments"]}
+    grounded = {(r["method"], r["qid"]) for r in run.state["grounding"]}
+    # kg_context reuses the kg_memory result for the same question, so it waits for that answer.
+    kg_ready = {q["qid"]: asyncio.Event() for q in questions}
+    for q in questions:
+        if ("kg_memory", q["qid"]) in answered or "kg_memory" not in methods:
+            kg_ready[q["qid"]].set()
     kg_slots = min(args.kg_concurrency, settings.max_active_queries)  # Memory.submit rejects beyond its cap.
     gates = {m: asyncio.Semaphore(kg_slots if m == "kg_memory" else args.concurrency) for m in methods}
-    judge_pace = pacer(args.judge_rpm)
+    judge_pace, ground_pace = pacer(args.judge_rpm), pacer(args.judge_rpm)
     run.phase("evaluate")
 
-    async def solve(method, q):
+    async def answer(method, q):
         key = (method, q["qid"])
         async with gates[method]:
-            if key not in answered:
-                run.state["running"][method].append(q["qid"])
-                run.dirty = True
-                started = time.monotonic()
-                try:
-                    row = await answerers[method](q)
-                except Exception as exc:
-                    row = {"pred": NO_ANSWER, "error": f"{type(exc).__name__}: {exc}"[:300]}
+            if key in answered or run.halted:
+                return
+            run.state["running"][method].append(q["qid"])
+            run.dirty = True
+            started = time.monotonic()
+            try:
+                row = await answerers[method](q)
+            except SpendCap as exc:
+                run.halt(str(exc))
+            except Exception as exc:
+                row = {"pred": NO_ANSWER, "error": f"{type(exc).__name__}: {exc}"[:300]}
+                if not run.halted:
                     run.log(f"{method} failed on {q['qid']}: {row['error']}")
-                finally:
-                    run.state["running"][method].remove(q["qid"])
-                if "retrieved" in row:
-                    row["gold_recall"] = len(set(q["gold"]) & set(row["retrieved"])) / len(q["gold"])
-                answered[key] = row = {"method": method, "qid": q["qid"], **row, "seconds": round(time.monotonic() - started, 1)}
-                run.add("answers", row)
-        if key in judged:
+            finally:
+                run.state["running"][method].remove(q["qid"])
+            if run.halted:  # In flight when the spend cap hit, so possibly degraded: a rerun redoes it.
+                return
+            if "retrieved" in row:
+                row["gold_recall"] = len(set(q["gold"]) & set(row["retrieved"])) / len(q["gold"])
+            answered[key] = row = {"method": method, "qid": q["qid"], **row, "seconds": round(time.monotonic() - started, 1)}
+            run.add("answers", row)
+
+    async def judge(method, q):
+        key = (method, q["qid"])
+        if key in judged or run.halted:
             return
         pred, reference = process_response(answered[key]["pred"]), process_response(q["reference"])
         first = len(q["question"].split(" ")) % 2 == 0  # Benchmark's order rule (LFRQADataProcessor).
@@ -446,6 +599,8 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
         try:
             text, cost = await client.chat(args.judge, [{"role": "system", "content": system}, *shots,
                                                         {"role": "user", "content": pair(q["question"], r1, r2)}], 256, pace=judge_pace)
+        except SpendCap as exc:
+            return run.halt(str(exc))
         except Exception as exc:
             # Not recorded: the benchmark would score this as a tie; a rerun retries it instead.
             run.log(f"judge failed on {method}/{q['qid']}: {exc}")
@@ -455,6 +610,40 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
         run.add("judgments", {"method": method, "qid": q["qid"], "winner": order[vote] if vote else "tie",
                               "vote": vote, "order": order, "thinking": thinking.group(1).strip() if thinking else text[:500], "cost": cost})
         judged.add(key)
+
+    async def ground(method, q):
+        """Extra column beside the arena's pairwise metric: the share of answer claims its own passages support."""
+        key = (method, q["qid"])
+        if method not in GROUNDED or key in grounded or run.halted:
+            return
+        pred = process_response(answered[key]["pred"])
+        row = {"method": method, "qid": q["qid"], "applicable": pred != NO_ANSWER}
+        if row["applicable"]:
+            try:
+                prompt = grounding_input(await used(method, q), pred)
+                text, cost = await client.chat(args.grounding_judge, [{"role": "system", "content": GROUNDING},
+                                                                      {"role": "user", "content": prompt}], 1500,
+                                               {"response_format": {"type": "json_object"}}, pace=ground_pace)
+                share, unsupported = parse_grounding(text)
+            except SpendCap as exc:
+                return run.halt(str(exc))
+            except Exception as exc:
+                run.log(f"grounding judge failed on {method}/{q['qid']}: {type(exc).__name__}: {exc}"[:300])
+                return
+            row.update(supported=share, unsupported=unsupported, cost=cost)
+        run.add("grounding", row)
+        grounded.add(key)
+
+    async def solve(method, q):
+        if method == "kg_context":
+            await kg_ready[q["qid"]].wait()
+        try:
+            await answer(method, q)
+        finally:
+            if method == "kg_memory":
+                kg_ready[q["qid"]].set()
+        if (method, q["qid"]) in answered and not args.skip_judge:
+            await asyncio.gather(judge(method, q), ground(method, q))
 
     await asyncio.gather(*(solve(m, q) for q in questions for m in methods))
 
@@ -467,9 +656,13 @@ if __name__ == "__main__":
     parser.add_argument("--negatives", type=int, default=4, help="BM25 hard negatives per question")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--methods", nargs="+", default=METHODS, choices=METHODS)
-    parser.add_argument("--redo", nargs="*", default=[], choices=METHODS, help="discard cached answers/judgments of these methods")
+    parser.add_argument("--redo", nargs="*", default=[], choices=METHODS,
+                        help="discard cached answers/judgments/grounding of these methods (kg_memory implies kg_context)")
     parser.add_argument("--judge", default="openai/gpt-4-turbo", help="paper: gpt-4-0125-preview")
     parser.add_argument("--judge-rpm", type=float, default=18, help="judge requests per minute (OpenRouter new-account cap is 20)")
+    parser.add_argument("--grounding-judge", default="openai/gpt-4.1-mini", help="checks answer claims against the passages used")
+    parser.add_argument("--skip-judge", action="store_true", help="answers and retrieval metrics only; judge later")
+    parser.add_argument("--reset-graph", action="store_true", help="wipe the benchmark graph and re-ingest (never the live one)")
     parser.add_argument("--passages", type=int, default=5)
     parser.add_argument("--answer-tokens", type=int, default=512)
     parser.add_argument("--concurrency", type=int, default=8)
@@ -481,4 +674,7 @@ if __name__ == "__main__":
     parser.add_argument("--arena", type=Path, default=Path("C:/code/benchmarks/rag-qa-arena-src"))
     parser.add_argument("--references", type=Path, default=Path("C:/code/benchmarks/rag-qa-arena/data/data"))
     parser.add_argument("--lotte", type=Path, default=Path("C:/code/benchmarks/robustqa-acl23/data/lotte"))
-    asyncio.run(main(parser.parse_args()))
+    arguments = parser.parse_args()
+    if "kg_memory" in arguments.redo and "kg_context" not in arguments.redo:
+        arguments.redo.append("kg_context")  # kg_context is derived from the kg_memory result.
+    sys.exit(asyncio.run(main(arguments)))
