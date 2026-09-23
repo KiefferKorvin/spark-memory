@@ -767,10 +767,13 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
         finally:
             if method == "kg_memory":
                 kg_ready[q["qid"]].set()
-        if (method, q["qid"]) in answered and not args.skip_judge:
-            await asyncio.gather(ground(method, q), grade(method, q))
 
     await asyncio.gather(*(solve(m, q) for q in questions for m in methods))
+    # Grading starts only after every answer: OpenRouter reserves each in-flight request's maximum cost, and
+    # high-reasoning judges running alongside the graph memory starved its calls (HTTP 402, failed queries).
+    if not args.skip_judge:
+        await asyncio.gather(*(asyncio.gather(ground(m, q), grade(m, q)) for q in questions for m in methods
+                               if (m, q["qid"]) in answered))
 
 
 if __name__ == "__main__":
