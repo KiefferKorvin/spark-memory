@@ -11,7 +11,7 @@ Navigation is exclusively `typesafe/jev-1.13` by default, configurable through `
 | FOUND_EVIDENCE | Current node is indicated as evidence; collector still verifies original text |
 | DEAD_END | Stop this branch and backtrack to remaining frontier work |
 
-Payloads contain the information need, current path/node, candidate routing metadata, existing evidence identifiers and remaining budgets. Unknown node IDs, duplicate choices, malformed JSON and invalid actions are rejected. A decision never constitutes evidence, grants access, or generates a final answer. Branch limits are enforced in code even if the policy selects too many nodes.
+Payloads contain the information need, current path/node, candidate routing metadata, existing evidence identifiers and remaining budgets. Unknown node IDs, duplicate choices, malformed JSON and invalid actions are rejected. A decision never constitutes evidence, grants access, or generates a final answer. Branch limits are enforced in code even if the policy selects too many nodes: `MAX_ROOT_CHILDREN` for the root decision of each need, `MAX_CHILDREN_PER_DECISION` below it. A root decision that keeps nothing is overridden by the `MIN_ROOT_CHILDREN` top-ranked candidates (`NAVIGATION_FLOOR` event).
 
 The separate semantic model handles understanding, concept resolution, decomposition, evidence relevance/coverage, enrichment and synthesis. Embeddings have their own model. All machine outputs are validated by Pydantic. Transient requests and malformed output get bounded exponential-backoff retries; permanent provider HTTP errors fail immediately. API keys never reach the frontend.
 

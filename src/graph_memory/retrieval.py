@@ -100,6 +100,8 @@ class ExplorationSupervisor:
             await self.trace.emit("BACKTRACK", branch, reason="no_unvisited_candidates")
             await self.trace.emit("BRANCH_COMPLETED", branch, status=branch.status)
             return
+        # A root decision chooses a need's entry points among all index candidates; deeper ones stay narrow.
+        breadth = self.settings.max_children_per_decision if branch.node_id else self.settings.max_root_children
         payload = {"information_need": need.model_dump(), "current_path": branch.path,
                    "current_node": preview(current) if current else None,
                    "candidate_children": [preview(n, s) for n, s in candidates],
@@ -115,15 +117,20 @@ class ExplorationSupervisor:
         except (ProviderError, ValueError):
             await self.trace.emit("MODEL_FAILURE", branch, operation="navigation", fallback="bounded_candidate_order")
             decision = NavigationDecision(decisions=[Decision(node_id=n.id, action="SELECT" if preview(n)["retrievable"] else "EXPAND")
-                                                       for n, _ in candidates[:self.settings.max_children_per_decision]],
+                                                       for n, _ in candidates[:breadth]],
                                           current_node_action="CONTINUE")
         actions = {d.node_id: d.action for d in decision.decisions}
         if decision.current_node_action == "DEAD_END":
             actions = {}
+        if not branch.node_id and all(a == "PRUNE" for a in actions.values()) and self.settings.min_root_children:
+            # Never explore nothing while candidates exist: the index ranking still carries signal.
+            floor = candidates[:self.settings.min_root_children]
+            actions = {n.id: "SELECT" if preview(n)["retrievable"] else "EXPAND" for n, _ in floor}
+            await self.trace.emit("NAVIGATION_FLOOR", branch, nodes=[trace_preview(n, s) for n, s in floor])
         taken = 0
         for node, score in candidates:
             action = actions.get(node.id, "PRUNE")
-            if action == "PRUNE" or taken >= self.settings.max_children_per_decision:
+            if action == "PRUNE" or taken >= breadth:
                 await self.trace.emit("NODE_PRUNED", branch, node_id=node.id,
                                       reason="policy" if action == "PRUNE" else "branch_budget")
                 continue

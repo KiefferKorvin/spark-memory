@@ -299,6 +299,50 @@ def test_api_auth_ingestion_query_events_replay_and_limits():
         assert client.post("/memory/ingest", json={"title":"invalid", "content_base64":base64.b64encode(b'bad PDF').decode(), "mime_type":"application/pdf"}).status_code == 422
 
 
+async def hub_graph():
+    """Six retrievable leaves about one concept hub."""
+    from graph_memory.models import Document
+    repo = InMemoryGraph()
+    docs = [Document(id=f"d{i}", label=f"note {i}", text=f"Piano note number {i}.", retrieval_leaf=True) for i in range(6)]
+    await repo.put([Concept(id="hub", label="Piano", preferred_label="Piano"), *docs],
+                   [Edge(source=d.id, target="hub", relation=Relation.ABOUT) for d in docs])
+    return repo
+
+
+async def test_root_breadth_and_navigation_floor():
+    from graph_memory.models import Branch, Decision, Need
+    from graph_memory.retrieval import ExplorationSupervisor
+    from graph_memory.trace import TraceService
+
+    class Policy(DemoModels):
+        def __init__(self, prune_all=False):
+            self.prune_all = prune_all
+        async def navigate(self, payload, query_id):
+            return NavigationDecision(decisions=[Decision(node_id=c["node_id"], action="SELECT" if c["retrievable"] and not self.prune_all else "PRUNE")
+                                                 for c in payload["candidate_children"]], current_node_action="DEAD_END" if self.prune_all else "CONTINUE")
+
+    need = Need(id="N1", description="piano note")
+    repo = await hub_graph()
+    supervisor = ExplorationSupervisor(settings(max_root_children=8, max_children_per_decision=4), repo, Policy(), TraceService(repo, "q"))
+    supervisor.ceiling = 100
+    root = Branch(information_need_id="N1")
+    await supervisor.work(root, need, [])
+    assert len([b for b in supervisor.branches if b.parent_branch_id == root.id]) == 6  # all six root SELECTs, cap 8
+    supervisor = ExplorationSupervisor(settings(max_root_children=8, max_children_per_decision=4), repo, Policy(), TraceService(repo, "q"))
+    supervisor.ceiling = 100
+    hub = Branch(information_need_id="N1", node_id="hub", path=["hub"], depth=1)
+    await supervisor.work(hub, need, [])
+    assert len([b for b in supervisor.branches if b.parent_branch_id == hub.id]) == 4  # below the root the cap stays 4
+
+    repo = await hub_graph()
+    supervisor = ExplorationSupervisor(settings(min_root_children=2), repo, Policy(prune_all=True), TraceService(repo, "q"))
+    await supervisor.explore([need])
+    events = await repo.records("event", "q:")
+    floor = [e for e in events if e["event_type"] == "NAVIGATION_FLOOR"]
+    assert len(floor) == 1 and len(floor[0]["metadata"]["nodes"]) == 2
+    assert supervisor.explored == 2  # the two top-ranked candidates were still explored
+
+
 async def test_external_sources_are_explored_with_fresh_budget():
     # The first pass exhausts its node budget; newly ingested sources are still examined directly.
     memory = make_memory(max_total_nodes_explored=2)

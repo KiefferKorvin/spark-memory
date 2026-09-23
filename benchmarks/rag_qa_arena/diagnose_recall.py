@@ -13,7 +13,8 @@ from neo4j import GraphDatabase
 RUN = Path(__file__).resolve().parent / "runs" / (sys.argv[1] if len(sys.argv) > 1 else "preview")
 questions = {q["qid"]: q for q in json.loads((RUN / "questions.json").read_text(encoding="utf-8"))}
 answers = {(a["method"], a["qid"]): a for a in map(json.loads, (RUN / "answers.jsonl").read_text(encoding="utf-8").splitlines())}
-cap = json.loads((RUN / "state.json").read_text(encoding="utf-8"))["config"]["kg"]["max_children_per_decision"]
+kg = json.loads((RUN / "state.json").read_text(encoding="utf-8"))["config"]["kg"]
+cap = kg.get("max_root_children", kg["max_children_per_decision"])  # breadth of root decisions
 corpus = {d["id"]: d for d in map(json.loads, (RUN / "corpus.jsonl").read_text(encoding="utf-8").splitlines())}
 
 driver = GraphDatabase.driver("bolt://localhost:7688", auth=("neo4j", "bench-local-only"))
@@ -58,7 +59,7 @@ with driver.session() as s:
             stage = ("evidence found but not in final context" if nodes & found else
                      "explored, relevance check rejected" if nodes & spawned else
                      "candidate, pruned by navigation policy" if any("policy" in pruned[n] for n in nodes) else
-                     "candidate, cut by max_children_per_decision" if any("branch_budget" in pruned[n] for n in nodes) else
+                     "candidate, cut by breadth cap" if any("branch_budget" in pruned[n] for n in nodes) else
                      "candidate, never scheduled (global budget)" if nodes & rank.keys() else "never a candidate")
             stages[stage] += 1
             examples[stage].append({"qid": qid, "question": q["question"], "needs": [n["description"] for n in needs], "gold": g,
@@ -72,6 +73,6 @@ print(f"missed gold documents: {sum(stages.values())}/{total}")
 for stage, n in stages.most_common():
     print(f"  {n:3}  {stage}  (dense RAG found {sum(i['dense_found_it'] for i in examples[stage])})")
 print(f"root candidate kinds: {dict(kinds)}")
-print(f"root decisions wanting more children than the cap ({cap}): {100 * mean(w > cap for w in wanted):.0f}%   "
+print(f"root decisions wanting more children than the root cap ({cap}): {100 * mean(w > cap for w in wanted):.0f}%   "
       f"explored children in the top {cap} by score: {100 * mean(top4):.0f}%   nodes explored per need: {mean(explored_per_need):.1f}")
 (RUN / "recall_diagnosis.json").write_text(json.dumps(examples, indent=1, ensure_ascii=False), encoding="utf-8")

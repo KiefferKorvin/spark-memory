@@ -399,7 +399,8 @@ async def main(args):
                                embedding_model=settings.embedding_model, navigation_model=settings.navigation_model,
                                api_key_source="ARENA_OPENROUTER_API_KEY" if key else "OPENROUTER_API_KEY",
                                kg={k: getattr(settings, k) for k in ("max_total_nodes_explored", "max_depth", "max_parallel_branches",
-                                   "max_children_per_decision", "candidate_limit", "context_token_budget", "query_timeout_seconds")})
+                                   "max_children_per_decision", "max_root_children", "min_root_children", "candidate_limit",
+                                   "context_token_budget", "query_timeout_seconds")})
     client = OpenRouter(settings.openrouter_api_key.get_secret_value())
     memory = Memory.from_settings(settings)
     watch_spend_cap(memory.models.client, run)

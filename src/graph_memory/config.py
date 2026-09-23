@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     candidate_limit: int = Field(20, ge=1, le=100)
     max_parallel_branches: int = Field(6, ge=1, le=20)
     max_children_per_decision: int = Field(3, ge=1, le=100)
+    # The root decision picks entry points for a whole need among the index candidates, so it may take more.
+    max_root_children: int = Field(8, ge=1, le=100)
+    # If the policy prunes every root candidate, the top-ranked ones are still explored (0 disables the floor).
+    min_root_children: int = Field(2, ge=0, le=100)
     max_depth: int = Field(10, ge=1, le=50)
     max_total_nodes_explored: int = Field(60, ge=1, le=10000)
     small_document_token_threshold: int = Field(500, ge=1)
@@ -58,6 +62,8 @@ class Settings(BaseSettings):
     def bounds(self):
         if self.target_chunk_tokens > self.max_chunk_tokens:
             raise ValueError("target_chunk_tokens must not exceed max_chunk_tokens")
+        if self.min_root_children > self.max_root_children:
+            raise ValueError("min_root_children must not exceed max_root_children")
         return self
 
     def validate_live(self):
