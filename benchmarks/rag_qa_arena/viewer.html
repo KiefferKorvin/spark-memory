@@ -106,14 +106,16 @@ const words = s => (s || "").split(/\s+/).filter(Boolean).length;
 // One verdict per answer, never a comparison: a win is correct (no contradiction or wrong information), complete
 // (no major omission of the reference) and sourced (every claim supported by the method's own passages).
 const PASSAGELESS = ["closed_book"];  // methods that read no passages, so can never be sourced
-function grade(c, g, m) {
+function grade(c, g, m, a) {
   if (!c) return null;
   if (c.reason === "no answer") return {win: false, why: "no answer"};
+  if (a && a.fallback) return {win: false, why: "no answer: the answer step failed and returned raw evidence"};
   if (!c.correct) return {win: false, why: "incorrect: " + c.reason};
   if (c.major_omission) return {win: false, why: "major omission: " + c.reason};
   if (!g && PASSAGELESS.includes(m)) return {win: false, why: "correct but unsourced (no passages)"};
   if (!g) return null;  // its sourcing check has not returned yet: pending, not a loss
-  if (g.supported == null || g.supported < 1) return {win: false, why: `unsupported claims (${g.supported == null ? "no claims checked" : (100 * g.supported).toFixed(0) + "% supported"})`};
+  // No factual claims at all (e.g. a salutation) means nothing is unsupported.
+  if (g.supported != null && g.supported < 1) return {win: false, why: `unsupported claims (${(100 * g.supported).toFixed(0)}% supported)`};
   return {win: true, why: "correct, complete and sourced"};
 }
 
@@ -155,12 +157,12 @@ function board(s, {ans, gr, cor, methods}) {
   const qs = s.questions.filter(q => domainFilter === "all" || q.domain === domainFilter);
   const share = (n, d) => d ? (100 * n / d).toFixed(0) + "%" : "–";
   const rows = methods.map(m => {
-    const cs = qs.map(q => cor[m + "|" + q.qid]).filter(c => c && grade(c, gr[m + "|" + c.qid], m));
+    const cs = qs.map(q => cor[m + "|" + q.qid]).filter(c => c && grade(c, gr[m + "|" + c.qid], m, ans[m + "|" + c.qid]));
     const gs = cs.map(c => gr[m + "|" + c.qid]).filter(g => g && g.supported != null);
     const as = s.answers.filter(a => a.method === m && qs.some(q => q.qid === a.qid));
-    return {m, n: cs.length, win: cs.filter(c => grade(c, gr[m + "|" + c.qid], m).win).length,
+    return {m, n: cs.length, win: cs.filter(c => grade(c, gr[m + "|" + c.qid], m, ans[m + "|" + c.qid]).win).length,
             correct: cs.filter(c => c.correct).length, omission: cs.filter(c => c.correct && c.major_omission).length,
-            grounded: gs.length, unsupported: gs.filter(g => g.supported < 1).length,
+            grounded: gs.length, unsupported: gs.filter(g => g.supported < 1).length,  // gs excludes claim-free answers
             recall: mean(as.filter(a => a.gold_recall != null).map(a => a.gold_recall)), cost: as.reduce((t, a) => t + (a.cost || 0), 0),
             errors: as.filter(a => a.error).length, words: mean(as.map(a => words(a.pred))), secs: mean(as.map(a => a.seconds || 0))};
   }).sort((a, b) => (b.n ? b.win / b.n : -1) - (a.n ? a.win / a.n : -1));
@@ -176,16 +178,16 @@ function board(s, {ans, gr, cor, methods}) {
     `<tr><td class="muted">LFRQA reference</td><td colspan="6"></td><td class="num muted">${refWords == null ? "–" : refWords.toFixed(0)}</td><td colspan="3"></td></tr>`;
 }
 
-function domains(s, {gr, cor, methods}) {
+function domains(s, {ans, gr, cor, methods}) {
   const ds = [...new Set(s.questions.map(q => q.domain))];
   return `<tr><th>Method</th>${ds.map(d => `<th class="num">${esc(d)}</th>`).join("")}</tr>` + methods.map(m => `<tr><td>${label(m)}</td>${ds.map(d => {
-    const verdicts = s.questions.map(q => q.domain === d && grade(cor[m + "|" + q.qid], gr[m + "|" + q.qid], m)).filter(Boolean).map(v => v.win);
+    const verdicts = s.questions.map(q => q.domain === d && grade(cor[m + "|" + q.qid], gr[m + "|" + q.qid], m, ans[m + "|" + q.qid])).filter(Boolean).map(v => v.win);
     return `<td class="num">${pct(verdicts.filter(Boolean).length, verdicts.length)} <span class="muted">(${verdicts.length})</span></td>`;
   }).join("")}</tr>`).join("");
 }
 
 function cell(s, m, q, {ans, gr, cor}) {
-  const v = grade(cor[m + "|" + q.qid], gr[m + "|" + q.qid], m), a = ans[m + "|" + q.qid];
+  const a = ans[m + "|" + q.qid], v = grade(cor[m + "|" + q.qid], gr[m + "|" + q.qid], m, a);
   if (v) return `<span class="chip ${v.win ? "W" : "L"}" title="${esc(LABELS[m])}: ${esc(v.why)}">${v.win ? "W" : "L"}</span>`;
   if (a) return `<span class="chip A" title="answered, awaiting grading">…</span>`;
   if ((s.running[m] || []).includes(q.qid)) return `<span class="chip R" title="running">●</span>`;
@@ -194,7 +196,7 @@ function cell(s, m, q, {ans, gr, cor}) {
 
 function detail(s, q, {ans, gr, cor, methods}) {
   const blocks = methods.map(m => {
-    const a = ans[m + "|" + q.qid], g = gr[m + "|" + q.qid], c = cor[m + "|" + q.qid], v = grade(c, g, m);
+    const a = ans[m + "|" + q.qid], g = gr[m + "|" + q.qid], c = cor[m + "|" + q.qid], v = grade(c, g, m, a);
     if (!a) return `<div class="ans"><h3>${label(m)} <span class="tag">pending</span></h3></div>`;
     const tags = [a.gold_recall != null ? `gold recall ${(100 * a.gold_recall).toFixed(0)}%` : null, `${a.seconds}s`, a.cost ? money(a.cost) : null,
       a.coverage ? `coverage ${a.coverage}` : null, a.nodes_explored != null ? `${a.nodes_explored} nodes` : null,
