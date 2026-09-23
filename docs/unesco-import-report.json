@@ -1,0 +1,112 @@
+{
+  "authority": "UNESCO",
+  "edition": "2026",
+  "scheme_uri": "http://vocabularies.unesco.org/thesaurus",
+  "parser_version": "unesco-skos-1",
+  "language": "fr",
+  "fingerprint": "b2b660755916ccd62dd8a1dc70145b363ffbb0fa27adb68edffb68024b465d6b",
+  "source_file": "C:\\code\\terminologies\\UNESCO-thesaurus-2026\\unesco-thesaurus.ttl",
+  "file_sha256": "fa78145d189776bfb97e1635200060012b853684b9f7d542d41804c37c5178c3",
+  "triples": 99711,
+  "concepts": 4500,
+  "groups": 95,
+  "relations": {
+    "BROADER_THAN": 4343,
+    "HAS_MEMBER": 4588,
+    "RELATED_TO": 6292
+  },
+  "scheme_properties": {
+    "http://purl.org/dc/terms/description": [
+      "El Tesauro de la UNESCO es una lista controlada y estructurada de términos para el análisis temático y la búsqueda de documentos y publicaciones en los campos de la educación, cultura, ciencias naturales, ciencias sociales y humanas, comunicación e información. Continuamente ampliada y actualizada, su terminología multidisciplinaria refleja la evolución de los programas y actividades de la UNESCO.",
+      "Le Thésaurus de l'UNESCO est une liste de termes contrôlés et structurés pour l'analyse thématique et la recherche de documents et publications dans les domaines de l'éducation, la culture, les sciences naturelles, les sciences sociales et humaines, la communication et l'information. Continuellement enrichie et mise à jour, sa terminologie reflète l'évolution des programmes et des activités de l'UNESCO.",
+      "The UNESCO Thesaurus is a controlled and structured list of terms used in subject analysis and retrieval of documents and publications in the fields of education, culture, natural sciences, social and human sciences, communication and information. Continuously enriched and updated, its multidisciplinary terminology reflects the evolution of UNESCO's programmes and activities.",
+      "проверенный и структурно оформленный список терминов, используемых для тематического анализа и поиска документов и публикаций в областях образования, культуры, естественных, социальных и гуманитарных наук, коммуникации и информации. Тезаурус постоянно пополняется и обновляется, его многодисциплинарная терминология отражает эволюцию программ и мероприятий Организации.",
+      "يُعد مكنز اليونسكو قائمة مصطلحات مقيدة ومنظَمة تُستخدم في تحليل الموضوعات واسترجاع الوثائق والمنشورات في مجالات التربية، الثقافة، العلوم الطبيعية، العلوم الاجتماعية والإنسانية، المعلومات والاتصالات. فمع تحديث هذه القائمة باستمرار وإثرائها، تعكس مصطلحاتها متعددة التخصصات تطور برامج اليونسكو وأنشطتها.\n\tتم إنتاج النسخة العربية بالدعم المالي من برنامج الأمير سلطان بن عبدالعزيز آل سعود لدعم اللغة العربية في اليونسكو وبالشراكة مع مكتبة الإسكندرية."
+    ],
+    "http://purl.org/dc/terms/created": [
+      "1977-01-01"
+    ],
+    "http://purl.org/dc/elements/1.1/creator": [
+      "UNESCO"
+    ],
+    "http://purl.org/dc/terms/isRequiredBy": [
+      "http://unesdoc.unesco.org/"
+    ],
+    "http://purl.org/dc/terms/rightsHolder": [
+      "UNESCO"
+    ],
+    "http://purl.org/dc/terms/modified": [
+      "2026-08-31"
+    ],
+    "http://purl.org/dc/terms/rights": [
+      "CC-BY-SA"
+    ],
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type": [
+      "http://www.w3.org/2004/02/skos/core#ConceptScheme"
+    ],
+    "http://purl.org/dc/terms/subject": [
+      "http://id.loc.gov/authorities/subjects/sh85029027",
+      "http://id.loc.gov/authorities/subjects/sh85034755",
+      "http://id.loc.gov/authorities/subjects/sh85040989",
+      "http://id.loc.gov/authorities/subjects/sh85062913",
+      "http://id.loc.gov/authorities/subjects/sh85118553",
+      "http://id.loc.gov/authorities/subjects/sh85124003",
+      "http://id.loc.gov/authorities/subjects/sh85133147"
+    ],
+    "http://purl.org/dc/terms/identifier": [
+      "http://vocabularies.unesco.org/thesaurus"
+    ],
+    "http://purl.org/dc/terms/format": [
+      "http://www.iana.org/assignments/media-types/application/rdf+xml"
+    ],
+    "http://www.w3.org/2004/02/skos/core#prefLabel": [
+      "Tesauro de la UNESCO",
+      "Thésaurus de l'UNESCO",
+      "UNESCO Thesaurus",
+      "Тезаурус ЮНЕСКО",
+      "مكنز اليونسكو"
+    ],
+    "http://purl.org/dc/elements/1.1/publisher": [
+      "UNESCO"
+    ],
+    "http://purl.org/dc/terms/conformsTo": [
+      "ISO 25964"
+    ],
+    "http://purl.org/dc/terms/type": [
+      "thesaurus"
+    ],
+    "http://purl.org/dc/terms/source": [
+      "https://unesdoc.unesco.org/ark:/48223/pf0000024743",
+      "https://unesdoc.unesco.org/ark:/48223/pf0000099512"
+    ],
+    "http://purl.org/dc/elements/1.1/subject": [
+      "Communication",
+      "Culture",
+      "Education",
+      "Humanities",
+      "Science",
+      "Social sciences",
+      "Technology"
+    ],
+    "http://purl.org/dc/terms/license": [
+      "http://creativecommons.org/licenses/by-sa/3.0/igo/"
+    ],
+    "http://purl.org/dc/elements/1.1/contributor": [
+      "UNESCO"
+    ],
+    "http://purl.org/dc/terms/language": [
+      "http://id.loc.gov/vocabulary/iso639-2/ara",
+      "http://id.loc.gov/vocabulary/iso639-2/eng",
+      "http://id.loc.gov/vocabulary/iso639-2/fre",
+      "http://id.loc.gov/vocabulary/iso639-2/rus",
+      "http://id.loc.gov/vocabulary/iso639-2/spa"
+    ],
+    "http://purl.org/dc/terms/replaces": [
+      "http://databases.unesco.org/thesaurus/"
+    ]
+  },
+  "warnings": [
+    "Preserved self-related concept: http://vocabularies.unesco.org/thesaurus/concept11393"
+  ],
+  "status": "imported"
+}

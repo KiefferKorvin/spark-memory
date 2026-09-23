@@ -1,0 +1,10 @@
+# Private service-to-service connection for the parent PAKT deployment.
+services:
+  api:
+    networks:
+      default:
+      atlas:
+        aliases: [memory-atlas]
+networks:
+  atlas:
+    name: pakt-atlas

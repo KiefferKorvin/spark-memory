@@ -1,0 +1,11 @@
+.venv/
+.env
+__pycache__/
+.pytest_cache/
+.pytest-unesco/
+frontend/node_modules/
+frontend/dist/
+frontend/.test-build/
+frontend/*.tsbuildinfo
+*.egg-info/
+benchmarks/rag_qa_arena/runs/

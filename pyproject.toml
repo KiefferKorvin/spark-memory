@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "progressive-graph-memory"
+version = "0.1.0"
+description = "Observable, provenance-preserving graph memory for AI applications"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1", "uvicorn[standard]>=0.34,<1", "neo4j>=5.26,<7",
+  "pydantic-settings>=2.7,<3", "httpx>=0.28,<1", "tiktoken>=0.9,<1",
+  "pypdf>=6,<7", "python-docx>=1.2,<2", "markdown-it-py>=3,<5", "rdflib>=7.1,<8"
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "pytest-asyncio>=0.25,<2"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]

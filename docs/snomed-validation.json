@@ -1,0 +1,13 @@
+{
+  "authority": "SNOMED-CT",
+  "format": "snomed-rf2-snapshot",
+  "language": "fr",
+  "fingerprint": "4fc379e0802a53be8d0ac1d6349be3abece38cceaf9549d5dbd960f4175aa3ba",
+  "source_file": "C:\\code\\terminologies\\terminologie-snomed-ct-fr-Juin 2026 v1.0\\src\\SnomedCT_ManagedServiceFR_PRODUCTION_FR1000315_20260621T120000Z.zip",
+  "file_sha256": "81c22801b4b2572d5903fc8faea75ba10cc0617f66a27efe51d60a88f6ccb8e0",
+  "concepts": 381253,
+  "groups": 0,
+  "relations": 1341416,
+  "semantics": "Active inferred is-a hierarchy and typed RF2 attributes; no OWL reasoning or inactive/historical concepts",
+  "status": "validated"
+}

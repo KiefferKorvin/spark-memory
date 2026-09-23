@@ -1,0 +1,39 @@
+services:
+  neo4j:
+    image: neo4j:5.26-community
+    environment:
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in .env}"
+    ports:
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    volumes:
+      - memory-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+  api:
+    build: .
+    env_file: .env
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      UNESCO_THESAURUS_PATH: /terminologies/unesco
+    volumes:
+      - type: bind
+        source: ${UNESCO_THESAURUS_PATH:?Set UNESCO_THESAURUS_PATH to the local thesaurus directory}
+        target: /terminologies/unesco
+        read_only: true
+    ports:
+      - "127.0.0.1:8010:8010"
+    depends_on:
+      neo4j:
+        condition: service_healthy
+  ui:
+    build: ./frontend
+    ports:
+      - "127.0.0.1:5174:80"
+    depends_on:
+      - api
+volumes:
+  memory-data:

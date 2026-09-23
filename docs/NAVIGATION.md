@@ -1,0 +1,20 @@
+# Jev navigation
+
+Navigation is exclusively `typesafe/jev-1.13` by default, configurable through `NAVIGATION_MODEL`. OpenRouter exposes its typed decisions separately from chat completions. The adapter submits a bounded state object and one choice question per candidate, plus a branch-status question, to `/api/alpha/decisions`. Responses are converted to the internal validated `NavigationDecision` schema.
+
+| Choice | Meaning |
+|---|---|
+| EXPAND | Schedule a promising container/concept branch |
+| SELECT | Retrieve evidence from the selected node |
+| PRUNE | Do not explore this candidate |
+| CONTINUE | Candidate routes remain |
+| FOUND_EVIDENCE | Current node is indicated as evidence; collector still verifies original text |
+| DEAD_END | Stop this branch and backtrack to remaining frontier work |
+
+Payloads contain the information need, current path/node, candidate routing metadata, existing evidence identifiers and remaining budgets. Unknown node IDs, duplicate choices, malformed JSON and invalid actions are rejected. A decision never constitutes evidence, grants access, or generates a final answer. Branch limits are enforced in code even if the policy selects too many nodes.
+
+The separate semantic model handles understanding, concept resolution, decomposition, evidence relevance/coverage, enrichment and synthesis. Embeddings have their own model. All machine outputs are validated by Pydantic. Transient requests and malformed output get bounded exponential-backoff retries; permanent provider HTTP errors fail immediately. API keys never reach the frontend.
+
+The central [prompt registry](../src/graph_memory/prompts.py) includes an explicit version. The bounded LRU cache keys include model, prompt version, operation, schema and payload; embeddings include model, dimensions and text hash. Cached routing/understanding results are reusable; navigation and coverage are not cached. Durable usage records include operation, model, query ID, input/output tokens, latency, provider-reported cost when available and attempt status. Missing costs remain unknown, not estimates fabricated from a price table.
+
+Provider reference: [OpenRouter Jev typed questions example](https://openrouter.ai/labs/jev/compile), [structured output documentation](https://openrouter.ai/docs/guides/features/structured-outputs). No live provider call is required by automated tests.
