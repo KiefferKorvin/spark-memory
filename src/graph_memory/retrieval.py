@@ -254,7 +254,8 @@ class RetrievalEngine:
         return [d for d in await asyncio.gather(*map(one, sources)) if d]
 
     async def shorten(self, payload, answer, context, limit, trace):
-        """Makes the length limit binding: one rewrite of an overlong answer. The draft stays when the rewrite
+        """Makes the length limit binding: one rewrite of an answer over 110% of it (longer answers make more claims
+        that can go beyond the evidence). The draft stays when the rewrite
         fails, cites nothing or is not shorter, so a long answer is never replaced by the raw-excerpt fallback."""
         before = answer_words(answer.answer, context)
         try:
@@ -305,7 +306,7 @@ class RetrievalEngine:
             answer.evidence_ids = cited(answer.answer, context)
             if context and not answer.evidence_ids:
                 raise ValueError("Answer must cite supplied evidence")
-            if limit and answer_words(answer.answer, context) > limit * 1.2:
+            if limit and answer_words(answer.answer, context) > limit * 1.1:
                 answer = await self.shorten(payload, answer, context, limit, trace)
         except (ValueError, ProviderError):
             # Retrieval work is never discarded because synthesis failed: fall back to the original excerpts.

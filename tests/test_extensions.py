@@ -86,6 +86,8 @@ async def test_synthesis_uses_requested_model_and_repairs_invalid_citations():
     calls.clear()
     await capped.structured('synthesis', {'evidence':[{'id':'E1','text':'Evidence'}], 'answer_max_words': 60}, Answer)
     assert calls[0]['messages'][0]['content'].endswith('Your answer should not be longer than 60 words, not counting citations.')
+    rules = calls[0]['messages'][2]['content']  # repeated after the evidence, where they are read last
+    assert calls[0]['messages'][2]['role'] == 'user' and 'Every sentence must be supported' in rules and rules.endswith('60 words, not counting citations.')
     assert 'answer_max_words' not in calls[0]['messages'][1]['content']  # an instruction, not user data
     await capped.close()
     await hybrid.close()

@@ -12,7 +12,7 @@ import httpx
 from pydantic import BaseModel, ValidationError
 
 from .models import Decision, NavigationDecision
-from .prompts import VERSION, prompt
+from .prompts import VERSION, prompt, synthesis_rules
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -110,7 +110,8 @@ class OpenRouter:
         result = await self.request("/api/v1/chat/completions", {
             **self.settings.openrouter_options, "model": model,
             "messages": [{"role": "system", "content": prompt(operation, limit)},
-                         {"role": "user", "content": serial}],
+                         {"role": "user", "content": serial},
+                         *([{"role": "user", "content": synthesis_rules(limit)}] if operation == "synthesis" else [])],
             "response_format": {"type": "json_schema", "json_schema": {
                 "name": schema.__name__, "strict": True, "schema": strict_schema(schema.model_json_schema())}},
             "max_tokens": 5000,
