@@ -5,7 +5,9 @@ from pathlib import Path
 
 import httpx
 
-from arena import (BM25, NO_ANSWER, OpenRouter, Run, SpendCap, context_texts, kg_passages, mine, parse_grounding,
+import json
+
+from arena import (BM25, NO_ANSWER, OpenRouter, Run, SpendCap, context_texts, kg_passages, mine, mixed_rows, parse_grounding,
                    parse_vote, passages, process_response, reset_refusal, watch_spend_cap, without_citations)
 
 assert process_response("<thinking>short</thinking>\nThe answer.") == "The answer."
@@ -90,6 +92,18 @@ async def spend_cap_stops_the_run():
         await memory_client.aclose()
 
 asyncio.run(spend_cap_stops_the_run())
+
+# A run never mixes cached rows made with another answer model, answer standard or judge into one leaderboard.
+with tempfile.TemporaryDirectory() as root:
+    old = Path(root) / "old"
+    old.mkdir()
+    (old / "state.json").write_text(json.dumps({"config": {"answer_model": "deepseek", "judge": "gpt-4-turbo"}}), encoding="utf-8")
+    (old / "answers.jsonl").write_text(json.dumps({"method": "bm25_rag", "qid": "q"}) + "\n", encoding="utf-8")
+    now = {"answer_model": "glm", "answer_standard": "v2", "judge": "gpt-4-turbo"}
+    assert "deepseek -> glm" in mixed_rows(old, now, [])
+    assert mixed_rows(old, now, ["bm25_rag"]) is None  # redone rows are discarded, so nothing is mixed
+    assert mixed_rows(old, {**now, "answer_model": "deepseek"}, []) is None  # unrecorded keys (answer_standard) never block
+    assert mixed_rows(Path(root) / "new", now, []) is None
 
 # Threshold calibration: the lowest threshold whose accepted links are >= 90% correct on 5+ labeled links.
 import contextlib, io  # noqa: E401,E402

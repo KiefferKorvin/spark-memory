@@ -11,12 +11,22 @@ from .sources import SourceService
 logger = logging.getLogger(__name__)
 
 
+def embedding_text(node):
+    """The text a node's retrieval embedding encodes; ingestion, enrichment and re-embedding must agree."""
+    if node.kind == "Assertion":
+        return node.proposition
+    if node.kind == "Concept":
+        return node.label + " " + node.description
+    return getattr(node, "context_header", node.label) + "\n" + node.routing_summary + "\n" + (node.text or node.summary)
+
+
 class IngestionEngine:
     def __init__(self, settings, repository, models):
         self.settings, self.repository, self.models = settings, repository, models
         self.sources = SourceService(settings)
         self.ontology = OntologyService(repository, models, settings.taxonomy_match_threshold, settings.primary_ontology,
-                                        settings.embedding_model, settings.taxonomy_provisional_threshold)
+                                        settings.embedding_model, settings.taxonomy_provisional_threshold,
+                                        model=settings.semantic_model)
         # Per-document locks avoid duplicate inference for identical content while unrelated
         # documents (e.g. several external sources found by one query) ingest concurrently.
         self.locks = weakref.WeakValueDictionary()
@@ -120,7 +130,7 @@ class IngestionEngine:
                 node.summary, node.routing_summary = understanding.summary, understanding.routing_summary
                 node.metadata["temporal_scope"] = understanding.temporal_scope
                 node.metadata["parser_version"] = PARSER_VERSION
-                node.embedding = await self.models.embed(getattr(node, "context_header", node.label) + "\n" + node.routing_summary + "\n" + (node.text or node.summary), query_id)
+                node.embedding = await self.models.embed(embedding_text(node), query_id)
                 if node.kind == "Document":
                     node.document_type, node.language = understanding.document_type, understanding.language
                 results[node.id] = understanding

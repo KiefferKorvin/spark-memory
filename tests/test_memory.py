@@ -417,6 +417,22 @@ async def test_original_question_reaches_candidate_search_and_relevance():
     assert Models.relevance and all(p["question"] == question for p in Models.relevance)
 
 
+async def test_reembedding_after_a_dimension_change_is_resumable():
+    from graph_memory.ingestion import embedding_text
+    from graph_memory.migrate import reembed
+    memory = make_memory(embedding_dimensions=64)  # the demo embedder returns 64 dimensions
+    await seed(memory)
+    repo = memory.repository
+    embedded = [n for n in repo.nodes.values() if n.embedding]
+    for node in embedded:  # as if written by an 8-dimension model
+        repo.nodes[node.id] = node.model_copy(update={"embedding": [1.0] * 8})
+    result = await reembed(repo, memory.models, memory.settings, batch=2)
+    assert result["nodes"] == len(embedded) and embedded
+    for node in embedded:
+        assert repo.nodes[node.id].embedding == await memory.models.embed(embedding_text(repo.nodes[node.id]))
+    assert (await reembed(repo, memory.models, memory.settings))["nodes"] == 0
+
+
 async def test_external_sources_are_explored_with_fresh_budget():
     # The first pass exhausts its node budget; newly ingested sources are still examined directly.
     memory = make_memory(max_total_nodes_explored=2)

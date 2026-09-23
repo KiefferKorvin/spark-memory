@@ -55,12 +55,13 @@ def cosine(a, b):
     return sum(x*y for x, y in zip(a, b)) / divisor if divisor else 0.0
 
 
-def rank(node, query, vector, hits=0):
+def rank(node, query, vector, hits=0, similarity=None):
     tokens = terms(query)
     label = words(node.label + " " + " ".join(getattr(node, "aliases", [])))
     content = words(node.routing_summary + " " + node.summary + " " + node.text)
     lexical = len(tokens & (label | content)) / max(1, len(tokens))
-    return (lexical * 0.5 + max(0, cosine(node.embedding, vector)) * 0.35
+    semantic = cosine(node.embedding, vector) if similarity is None else similarity
+    return (lexical * 0.5 + max(0, semantic) * 0.35
             + len(tokens & label) / max(1, len(tokens)) * 0.1
             + min(hits, 20) * 0.0025)
 
@@ -86,6 +87,8 @@ class GraphRepository(Protocol):
     async def read_record(self, category: str, key: str) -> dict | None: ...
     async def records(self, category: str, prefix: str = "", after: str | None = None) -> list[dict]: ...
     async def delete_records(self, category: str, prefix: str = ""): ...
+    async def stale_embeddings(self, dimensions: int, limit: int) -> list[Node]: ...
+    async def update_embeddings(self, nodes: list[Node]): ...
     async def hit(self, node_id: str, success: bool = False) -> int: ...
 
 
@@ -146,8 +149,15 @@ def protect_taxonomy(nodes, edges):
                 raise ValueError("Official taxonomy relationships are writable only by the taxonomy importer")
 
 
+# Cosine in [-1, 1] computed in the database, so payloads need not carry vectors back to Python.
+SIMILARITY = ("CASE WHEN size($vector)>0 AND size(coalesce(n.embedding,[]))=size($vector) "
+              "THEN 2*vector.similarity.cosine(n.embedding,$vector)-1 ELSE 0.0 END")
+VECTOR_INDEXES = {"memory_vector": "MemoryNode) ON (n.embedding", "ontology_vector": "ImportedConcept) ON (n.ontology_embedding"}
+
+
 def node_properties(node):
-    return {"payload": node.model_dump_json(), "kind": node.kind, "label": node.label,
+    # The vector lives only in the indexed property: in the payload, 4096 floats would add ~90 KB to every row read.
+    return {"payload": node.model_dump_json(exclude={"embedding"}), "kind": node.kind, "label": node.label,
             "label_key": node.label.casefold(), "text": node.text, "routing_summary": node.routing_summary,
             "embedding": node.embedding, "aliases": [a.casefold() for a in getattr(node, "aliases", [])],
             "origin": getattr(node, "origin", None), "uri": getattr(node, "uri", None)}
@@ -294,6 +304,14 @@ class InMemoryGraph:
         for key in [k for k in self.data if k[0] == category and k[1].startswith(prefix)]:
             del self.data[key]
 
+    async def stale_embeddings(self, dimensions, limit):
+        return [n.model_copy(deep=True) for n in self.nodes.values() if n.embedding and len(n.embedding) != dimensions][:limit]
+
+    async def update_embeddings(self, nodes):
+        async with self.lock:
+            for node in nodes:
+                self.nodes[node.id] = self.nodes[node.id].model_copy(update={"embedding": node.embedding})
+
     async def hit(self, node_id, success=False):
         self.stats[node_id]["successful_retrievals" if success else "navigation_hits"] += 1
         return self.stats[node_id]["successful_retrievals"]
@@ -323,16 +341,30 @@ class Neo4jGraph:
             "CREATE CONSTRAINT ontology_uri IF NOT EXISTS FOR (n:ImportedTaxonomy) REQUIRE (n.origin,n.uri) IS UNIQUE",
             "CREATE FULLTEXT INDEX ontology_text IF NOT EXISTS FOR (n:ImportedConcept) ON EACH [n.label,n.aliases,n.routing_summary]",
             "CREATE FULLTEXT INDEX memory_text IF NOT EXISTS FOR (n:MemoryNode) ON EACH [n.label, n.text, n.routing_summary, n.aliases]",
-            "CREATE VECTOR INDEX memory_vector IF NOT EXISTS FOR (n:MemoryNode) ON (n.embedding) OPTIONS {indexConfig: {`vector.dimensions`: "
-            + str(self.settings.embedding_dimensions) + ", `vector.similarity_function`: 'cosine'}}",
-            # A separate property and index: thesaurus embeddings must never crowd memory_vector's content hits.
-            "CREATE VECTOR INDEX ontology_vector IF NOT EXISTS FOR (n:ImportedConcept) ON (n.ontology_embedding) OPTIONS {indexConfig: {`vector.dimensions`: "
-            + str(self.settings.embedding_dimensions) + ", `vector.similarity_function`: 'cosine'}}",
         ]:
             await self.run(statement)
+        await self.vector_indexes()
         await self.run("MATCH (n:UNESCO) SET n:ImportedTaxonomy")
         await self.run("MATCH (n:UNESCOConcept) SET n:ImportedConcept")
         await self.run("CALL db.awaitIndexes(60)")
+
+    async def vector_indexes(self, migrate=False):
+        """Creates the vector indexes. An index keeps the dimension it was created with, so after an
+        EMBEDDING_DIMENSIONS change it is rebuilt only when no stored vector would be orphaned (e.g. a reset graph)
+        or during the explicit, paid re-embedding migration (python -m graph_memory.migrate)."""
+        dimensions = self.settings.embedding_dimensions
+        rows = await self.run("SHOW INDEXES YIELD name, type, options WHERE type='VECTOR' RETURN name, options")
+        stale = {r["name"]: r["options"]["indexConfig"]["vector.dimensions"] for r in rows
+                 if r["name"] in VECTOR_INDEXES and r["options"]["indexConfig"]["vector.dimensions"] != dimensions}
+        if stale and not migrate and await self.run("MATCH (n:MemoryNode) WHERE size(coalesce(n.embedding,[]))>0 "
+                                                    "OR n.ontology_embedding IS NOT NULL RETURN n.id LIMIT 1"):
+            raise ValueError(f"Vector indexes {stale} do not match EMBEDDING_DIMENSIONS={dimensions}: run "
+                             "python -m graph_memory.migrate to re-embed the stored vectors, or use a separate database")
+        for name in stale:
+            await self.run(f"DROP INDEX {name} IF EXISTS")
+        for name, target in VECTOR_INDEXES.items():  # A separate ontology index: thesaurus vectors never crowd content hits.
+            await self.run(f"CREATE VECTOR INDEX {name} IF NOT EXISTS FOR (n:{target}) OPTIONS {{indexConfig: "
+                           f"{{`vector.dimensions`: {dimensions}, `vector.similarity_function`: 'cosine'}}}}")
 
     async def close(self):
         await self.driver.close()
@@ -373,7 +405,7 @@ class Neo4jGraph:
                                    id=node.id, props=props)).consume()
                 if node.kind == "Concept":
                     await (await tx.run("MATCH (n:Concept {id:$id}) SET n.payload=$payload,n.aliases=$aliases",
-                                       id=node.id, payload=node.model_dump_json(), aliases=props["aliases"])).consume()
+                                       id=node.id, payload=props["payload"], aliases=props["aliases"])).consume()
             for edge in edges:
                 relation = edge.relation.value  # enum, never user Cypher
                 if edge.relation in (Relation.BROADER_THAN, Relation.CONTAINS):
@@ -468,11 +500,11 @@ class Neo4jGraph:
         # Independent indexes seed candidates; parent filtering also ranks its whole neighborhood in the DB.
         # The content filter runs before LIMIT so thousands of empty taxonomy labels cannot crowd out content.
         rows = await self.run("CALL db.index.fulltext.queryNodes('memory_text',$query) YIELD node AS n,score "
-                              f"WHERE {CONTENT_FILTER} RETURN n.payload AS payload,score ORDER BY score DESC LIMIT $pool",
-                              query=lexical, pool=limit*4)
+                              f"WHERE {CONTENT_FILTER} RETURN n.payload AS payload,{SIMILARITY} AS similarity ORDER BY score DESC LIMIT $pool",
+                              query=lexical, pool=limit*4, vector=vector)
         if vector:
             rows += await self.run("CALL db.index.vector.queryNodes('memory_vector',$pool,$vector) YIELD node AS n,score "
-                                   f"WHERE {CONTENT_FILTER} RETURN n.payload AS payload,score", pool=limit*4, vector=vector)
+                                   f"WHERE {CONTENT_FILTER} RETURN n.payload AS payload,{SIMILARITY} AS similarity", pool=limit*4, vector=vector)
         ids = None
         if parent:
             neighbors = await self.run(
@@ -481,7 +513,7 @@ class Neo4jGraph:
                 "WITH DISTINCT n, size([t IN $terms WHERE toLower(n.label+' '+n.routing_summary+' '+n.text) CONTAINS t]) "
                 "+ CASE WHEN size(n.embedding)=size($vector) AND size($vector)>0 THEN vector.similarity.cosine(n.embedding,$vector) ELSE 0 END "
                 "+ 0.01*coalesce(n.successful_retrievals,0) AS score "
-                "RETURN n.payload AS payload,score ORDER BY score DESC LIMIT $pool",
+                f"RETURN n.payload AS payload,score,{SIMILARITY} AS similarity ORDER BY score DESC LIMIT $pool",
                 parent=parent, kind=kind, terms=list(terms(query)), vector=vector, pool=limit*4)
             rows += neighbors
             # Restrict index hits to actual neighbors, without sending a huge child list to Python/Jev.
@@ -489,8 +521,11 @@ class Neo4jGraph:
             allowed = await self.run("MATCH (:MemoryNode {id:$parent})--(n:MemoryNode) WHERE n.id IN $ids RETURN DISTINCT n.id AS id",
                                      parent=parent, ids=candidates)
             ids = {r["id"] for r in allowed}
-        nodes = {json.loads(r["payload"])["id"]: node_from(json.loads(r["payload"])) for r in rows}
-        scored = [(n, rank(n, query, vector)) for n in nodes.values()
+        nodes, similarity = {}, {}
+        for row in rows:
+            node = node_from(json.loads(row["payload"]))
+            nodes[node.id], similarity[node.id] = node, row["similarity"]
+        scored = [(n, rank(n, query, vector, similarity=similarity[n.id])) for n in nodes.values()
                   if n.kind not in ("Source", "ExternalConcept") and (not kind or n.kind == kind)
                   and (ids is None or n.id in ids)]
         return sorted(scored, key=lambda p: (-p[1], p[0].id))[:limit]
@@ -527,6 +562,15 @@ class Neo4jGraph:
     async def delete_records(self, category, prefix=""):
         await self.run("MATCH (r:MemoryRecord {category:$category}) WHERE r.key STARTS WITH $prefix DELETE r",
                        category=category, prefix=prefix)
+
+    async def stale_embeddings(self, dimensions, limit):
+        rows = await self.run("MATCH (n:MemoryNode) WHERE size(coalesce(n.embedding,[]))>0 AND size(n.embedding)<>$dimensions "
+                              "RETURN n.payload AS payload LIMIT $limit", dimensions=dimensions, limit=limit)
+        return [node_from(json.loads(r["payload"])) for r in rows]
+
+    async def update_embeddings(self, nodes):
+        await self.run("UNWIND $rows AS row MATCH (n:MemoryNode {id:row.id}) SET n.embedding=row.embedding, n.payload=row.payload",
+                       rows=[{"id": n.id, "embedding": n.embedding, "payload": node_properties(n)["payload"]} for n in nodes])
 
     async def hit(self, node_id, success=False):
         field = "successful_retrievals" if success else "navigation_hits"

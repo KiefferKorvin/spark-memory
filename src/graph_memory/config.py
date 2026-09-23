@@ -8,8 +8,11 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     memory_mode: Literal["live", "demo", "online_demo"] = "live"
     openrouter_api_key: SecretStr = SecretStr("")
-    semantic_model: str = "deepseek/deepseek-v4.1-flash"
-    synthesis_model: str = "deepseek/deepseek-v4.1-flash"
+    semantic_model: str = "z-ai/glm-5.3-flash"
+    synthesis_model: str = "z-ai/glm-5.3-flash"
+    # Answer length cap for synthesis (0: none). A comparison sets one standard for every system it judges,
+    # since judges tend to prefer longer answers.
+    answer_max_words: int = Field(0, ge=0, le=2000)
     # Merged into every structured chat request. OpenRouter's default routing is price-weighted and can land on
     # very slow providers (observed: 84 s vs 3 s per call); these extraction tasks also do not need hidden reasoning.
     openrouter_options: dict = {"provider": {"sort": "throughput", "require_parameters": True}, "reasoning": {"enabled": False}}

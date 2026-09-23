@@ -1,8 +1,13 @@
 """RAG-QA Arena (Han et al., 2024) for the progressive graph memory versus standard RAG baselines.
 
-Faithful to the benchmark: RobustQA/LoTTE test collections, LFRQA reference answers, the answer template
-`ans_generation_v1.cfg`, and the pairwise judge against LFRQA with the benchmark's own system prompt,
-few-shot examples, answer ordering and rating parser. Methods share one answer model and one mixed corpus.
+Faithful to the benchmark: RobustQA/LoTTE test collections, LFRQA reference answers, the benchmark's answer
+templates, and the pairwise judge against LFRQA with the benchmark's own system prompt, few-shot examples,
+answer ordering and rating parser. Methods share one answer model and one mixed corpus.
+
+Every method answers under one length standard, the benchmark's `ans_generation_v2.cfg` ("not longer than 50-60
+words"), and the graph memory's own synthesis gets the same cap (ANSWER_MAX_WORDS=60): the judge prefers "more
+truthful or helpful information", so unequal lengths would be scored instead of retrieval. --unbounded-answers
+restores the paper's `ans_generation_v1.cfg` without caps.
 
 Subset: `--per-domain` questions per LoTTE domain; the corpus is their gold documents plus `--negatives`
 BM25 hard negatives per question mined from the full domain collection (BM25 retrieves over the same corpus,
@@ -19,6 +24,7 @@ ARENA_OPENROUTER_API_KEY (environment or memory\\.env) replaces OPENROUTER_API_K
                 graph memory, so benchmarks cannot exhaust the live app's spend cap. state.json records which was used.
 A spend-cap refusal (HTTP 402, or 403 "Key limit exceeded") stops the run: one log line, no new work, state saved,
 exit code 2. Rows in flight when it hit are not recorded; cached rows stay valid, so a rerun resumes.
+A run refuses to resume on cached rows made with another answer model, answer standard, embedding model or judge.
 """
 import argparse
 import asyncio
@@ -51,9 +57,16 @@ GROUNDED = ["bm25_rag", "dense_rag", "oracle_rag", "kg_memory", "kg_context"]  #
 NO_ANSWER = "I couldn't find an answer."
 STOP = set("a an the of to in on for and or is are was were be been it its this that with as by at from how what why "
            "when where which who whom do does did can could should would will i you my your me we our not no if so".split())
-CLOSED_BOOK = ("Provide a helpful answer to the query. Query is in the <query></query> tags.\n\n<query>\n{q}\n</query>\n\n"
-               "First, think step by step, and put your thinking in <thinking> tags. Your thinking must be shorter than "
-               "50 words. Then, provide your answer.")
+# Closed-book prompts mirror the passage templates of the same standard, without passages.
+STANDARDS = {
+    "ans_generation_v2.cfg (50-60 words)": ("ans_generation_v2.cfg", 60, "Provide a helpful answer to the query. Query is in "
+        "the <query></query> tags.\n\n<query>\n{q}\n</query>\n\nProvide a helpful answer to the query. "
+        "Your answer should not be longer than 50-60 words."),
+    "ans_generation_v1.cfg (unbounded)": ("ans_generation_v1.cfg", 0, "Provide a helpful answer to the query. Query is in "
+        "the <query></query> tags.\n\n<query>\n{q}\n</query>\n\nFirst, think step by step, and put your thinking in "
+        "<thinking> tags. Your thinking must be shorter than 50 words. Then, provide your answer."),
+}
+NO_REASONING = {"reasoning": {"enabled": False}}  # judges answer within 256 tokens; hidden reasoning would eat them
 
 
 def tokens(text):
@@ -368,6 +381,20 @@ def reset_refusal(uri, live_uri):
     return None
 
 
+def mixed_rows(path, produced, redo):
+    """Why cached rows of this run must not be mixed with new ones, or None: rows made with another answer model,
+    answer standard, embedding model or judge would share a leaderboard with rows that are not comparable."""
+    state = path / "state.json"
+    previous = json.loads(state.read_text(encoding="utf-8"))["config"] if state.exists() else {}
+    changed = {k: f"{previous[k]} -> {v}" for k, v in produced.items() if k in previous and previous[k] != v}
+    kept = {json.loads(line)["method"] for name in ("answers", "judgments", "grounding") if (path / f"{name}.jsonl").exists()
+            for line in (path / f"{name}.jsonl").read_text(encoding="utf-8").splitlines() if json.loads(line)["method"] not in redo}
+    if changed and kept:
+        return (f"runs/{path.name} holds rows for {', '.join(sorted(kept))} made with other settings ({changed}); "
+                "start a new --run, or --redo those methods")
+    return None
+
+
 async def reset_graph(repository):
     """Deletes every node and relationship in batches, so no single transaction holds the whole graph."""
     while (await repository.run("MATCH (n) WITH n LIMIT 5000 DETACH DELETE n RETURN count(*) AS deleted"))[0]["deleted"]:
@@ -376,6 +403,19 @@ async def reset_graph(repository):
 
 async def main(args):
     if args.reset_graph and (refusal := reset_refusal(args.neo4j_uri, Settings(_env_file=MEMORY / ".env").neo4j_uri)):
+        raise SystemExit(refusal)
+    standard = next(name for name in STANDARDS if ("v1" in name) == args.unbounded_answers)
+    overrides = dict(kv.split("=", 1) for kv in args.kg_setting)
+    overrides.setdefault("answer_max_words", STANDARDS[standard][1])
+    # A dedicated benchmark key keeps a runaway run from exhausting the live app's spend cap.
+    key = os.environ.get("ARENA_OPENROUTER_API_KEY") or dotenv_values(MEMORY / ".env").get("ARENA_OPENROUTER_API_KEY")
+    if key:
+        overrides["openrouter_api_key"] = key
+    settings = Settings(_env_file=MEMORY / ".env", neo4j_uri=args.neo4j_uri, neo4j_password=args.neo4j_password,
+                        external_retrievers="", **overrides)
+    produced = {"answer_model": settings.synthesis_model, "answer_standard": standard,
+                "embedding_model": settings.embedding_model, "judge": args.judge, "grounding_judge": args.grounding_judge}
+    if refusal := mixed_rows(HERE / "runs" / args.run, produced, args.redo):
         raise SystemExit(refusal)
     config = {k: str(v) for k, v in vars(args).items()}
     run = Run(HERE / "runs" / args.run, config)
@@ -389,20 +429,12 @@ async def main(args):
     run.state["corpus"] = {"documents": len(corpus), "gold": sum(d["role"] == "gold" for d in corpus),
                            "by_domain": Counter(d["domain"] for d in corpus)}
 
-    overrides = dict(kv.split("=", 1) for kv in args.kg_setting)
-    # A dedicated benchmark key keeps a runaway run from exhausting the live app's spend cap.
-    key = os.environ.get("ARENA_OPENROUTER_API_KEY") or dotenv_values(MEMORY / ".env").get("ARENA_OPENROUTER_API_KEY")
-    if key:
-        overrides["openrouter_api_key"] = key
-    settings = Settings(_env_file=MEMORY / ".env", neo4j_uri=args.neo4j_uri, neo4j_password=args.neo4j_password,
-                        external_retrievers="", **overrides)
-    run.state["config"].update(answer_model=settings.synthesis_model, semantic_model=settings.semantic_model,
-                               embedding_model=settings.embedding_model, navigation_model=settings.navigation_model,
+    run.state["config"].update(**produced, semantic_model=settings.semantic_model, navigation_model=settings.navigation_model,
                                api_key_source="ARENA_OPENROUTER_API_KEY" if key else "OPENROUTER_API_KEY",
                                kg={k: getattr(settings, k) for k in ("max_total_nodes_explored", "max_depth", "max_parallel_branches",
                                    "max_children_per_decision", "max_root_children", "min_root_children", "candidate_limit", "navigation_excerpt_tokens",
                                    "taxonomy_match_threshold", "taxonomy_provisional_threshold",
-                                   "context_token_budget", "query_timeout_seconds")})
+                                   "context_token_budget", "answer_max_words", "query_timeout_seconds")})
     client = OpenRouter(settings.openrouter_api_key.get_secret_value())
     memory = Memory.from_settings(settings)
     watch_spend_cap(memory.models.client, run)
@@ -482,7 +514,8 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
     vectors = await client.embed(settings.embedding_model, [p["text"] for p in psgs])
     qvectors = dict(zip([q["qid"] for q in questions], await client.embed(settings.embedding_model, [q["question"] for q in questions])))
     texts = {d["id"]: d["text"] for d in corpus}
-    answer_template = template(args.arena, "ans_generation_v1.cfg")
+    answer_template, _, closed_prompt = STANDARDS[run.state["config"]["answer_standard"]]
+    answer_template = template(args.arena, answer_template)
     pair_template = template(args.arena, "pairwise_lfrqa.cfg")
     system = (args.arena / "templates" / "pairwise_lfrqa_system.txt").read_text(encoding="utf-8")
     examples = json.loads((args.arena / "templates" / "pairwise_lfrqa_examples.json").read_text(encoding="utf-8"))
@@ -500,7 +533,7 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
         return {"pred": process_response(text), "cost": cost, "retrieved": [d for d in dict.fromkeys(p["doc"] for p in chosen) if d]}
 
     async def closed_book(q):
-        text, cost = await client.chat(settings.synthesis_model, [{"role": "user", "content": CLOSED_BOOK.format(q=q["question"])}],
+        text, cost = await client.chat(settings.synthesis_model, [{"role": "user", "content": closed_prompt.format(q=q["question"])}],
                                        args.answer_tokens, settings.openrouter_options)
         return {"pred": process_response(text), "cost": cost}
 
@@ -606,7 +639,7 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
         r1, r2 = (pred, reference) if first else (reference, pred)
         try:
             text, cost = await client.chat(args.judge, [{"role": "system", "content": system}, *shots,
-                                                        {"role": "user", "content": pair(q["question"], r1, r2)}], 256, pace=judge_pace)
+                                                        {"role": "user", "content": pair(q["question"], r1, r2)}], 256, NO_REASONING, pace=judge_pace)
         except SpendCap as exc:
             return run.halt(str(exc))
         except Exception as exc:
@@ -631,7 +664,7 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
                 prompt = grounding_input(await used(method, q), pred)
                 text, cost = await client.chat(args.grounding_judge, [{"role": "system", "content": GROUNDING},
                                                                       {"role": "user", "content": prompt}], 1500,
-                                               {"response_format": {"type": "json_object"}}, pace=ground_pace)
+                                               {**NO_REASONING, "response_format": {"type": "json_object"}}, pace=ground_pace)
                 share, unsupported = parse_grounding(text)
             except SpendCap as exc:
                 return run.halt(str(exc))
@@ -666,9 +699,11 @@ if __name__ == "__main__":
     parser.add_argument("--methods", nargs="+", default=METHODS, choices=METHODS)
     parser.add_argument("--redo", nargs="*", default=[], choices=METHODS,
                         help="discard cached answers/judgments/grounding of these methods (kg_memory implies kg_context)")
-    parser.add_argument("--judge", default="openai/gpt-4-turbo", help="paper: gpt-4-0125-preview")
+    parser.add_argument("--judge", default="z-ai/glm-5.3-flash", help="paper: gpt-4-0125-preview; the default limits cost")
     parser.add_argument("--judge-rpm", type=float, default=18, help="judge requests per minute (OpenRouter new-account cap is 20)")
-    parser.add_argument("--grounding-judge", default="openai/gpt-4.1-mini", help="checks answer claims against the passages used")
+    parser.add_argument("--grounding-judge", default="z-ai/glm-5.3-flash", help="checks answer claims against the passages used")
+    parser.add_argument("--unbounded-answers", action="store_true",
+                        help="the paper's ans_generation_v1.cfg and no synthesis cap, instead of the 50-60 word standard")
     parser.add_argument("--skip-judge", action="store_true", help="answers and retrieval metrics only; judge later")
     parser.add_argument("--reset-graph", action="store_true", help="wipe the benchmark graph and re-ingest (never the live one)")
     parser.add_argument("--passages", type=int, default=5)

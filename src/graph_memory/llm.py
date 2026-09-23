@@ -105,7 +105,8 @@ class OpenRouter:
             return value
         result = await self.request("/api/v1/chat/completions", {
             **self.settings.openrouter_options, "model": model,
-            "messages": [{"role": "system", "content": prompt(operation)}, {"role": "user", "content": serial}],
+            "messages": [{"role": "system", "content": prompt(operation, self.settings.answer_max_words if operation == "synthesis" else 0)},
+                         {"role": "user", "content": serial}],
             "response_format": {"type": "json_schema", "json_schema": {
                 "name": schema.__name__, "strict": True, "schema": strict_schema(schema.model_json_schema())}},
             "max_tokens": 5000,

@@ -81,9 +81,10 @@ class OntologyService:
     classification_status="provisional" instead of skipping it. Model-decided skips are cached per label
     (MemoryRecord "classification_skip") so later documents do not pay for the same verdict again.
     """
-    def __init__(self, repository, models, threshold=0.75, authority="UNESCO", embedding_model="", provisional=0.5, cache=True):
+    def __init__(self, repository, models, threshold=0.75, authority="UNESCO", embedding_model="", provisional=0.5, cache=True,
+                 model=""):
         self.repository = repository
-        self.authority, self.embedding_model = authority, embedding_model
+        self.authority, self.embedding_model, self.model = authority, embedding_model, model
         self.models, self.threshold, self.provisional = models, threshold, min(provisional, threshold)
         self.resolver = ConceptResolver(repository, models)
         self.semantic, self.cache = False, cache
@@ -213,9 +214,10 @@ class OntologyService:
         return f"{self.authority}:{spec.label.strip().casefold()}"
 
     async def skip_cache_scope(self):
-        """Cached verdicts hold for one thesaurus snapshot, threshold pair and prompt version; a change clears them."""
+        """Cached verdicts hold for one thesaurus snapshot, classifier model, threshold pair and prompt version;
+        a change clears them."""
         manifest = await self.repository.read_record("taxonomy", self.authority) or {}
-        scope = {"fingerprint": manifest.get("fingerprint"), "threshold": self.threshold,
+        scope = {"fingerprint": manifest.get("fingerprint"), "threshold": self.threshold, "model": self.model,
                  "provisional": self.provisional, "prompt_version": VERSION}
         if await self.repository.read_record("classification_skip_scope", self.authority) != scope:
             await self.clear_skip_cache()

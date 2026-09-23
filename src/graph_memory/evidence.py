@@ -111,7 +111,8 @@ class MemoryEnrichmentService:
             raise ValueError("Enrichment requires an original retrieval leaf")
         if await self.repository.read_record("enriched", node_id):
             return []
-        candidates = await self.repository.candidates(node.summary or node.text[:500], node.embedding, 12, kind="Assertion")
+        probe = node.summary or node.text[:500]  # stored payloads carry no vector, so embed the probe text itself
+        candidates = await self.repository.candidates(probe, await self.models.embed(probe, query_id), 12, kind="Assertion")
         existing = [n for n, _ in candidates]
         output = await self.models.structured("enrichment", {
             "text": node.text, "existing_assertions": [n.model_dump() for n in existing],

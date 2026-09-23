@@ -37,7 +37,7 @@ On Linux/macOS use `.venv/bin/python` and `export MEMORY_MODE=demo`.
 
 ## Run with Neo4j and OpenRouter
 
-Copy `.env.example` to `.env`. Set `MEMORY_MODE=live`, `NEO4J_PASSWORD`, `OPENROUTER_API_KEY`, `SEMANTIC_MODEL`, `EMBEDDING_MODEL`, and matching `EMBEDDING_DIMENSIONS`. Semantic and embedding models are intentionally configuration choices; select models supporting structured output and embeddings respectively. Jev defaults to `typesafe/jev-1.13` and uses the dedicated `/api/alpha/decisions` endpoint.
+Copy `.env.example` to `.env`. Set `MEMORY_MODE=live`, `NEO4J_PASSWORD`, `OPENROUTER_API_KEY`, `SEMANTIC_MODEL`, `EMBEDDING_MODEL`, and matching `EMBEDDING_DIMENSIONS`. Semantic and embedding models are intentionally configuration choices; select models supporting structured output and embeddings respectively. The defaults are `z-ai/glm-5.3-flash` for every semantic and synthesis call and `qwen/qwen3-embedding-8b` at 4096 dimensions. Neo4j vector indexes keep the dimension they were created with: after changing `EMBEDDING_DIMENSIONS` on a graph that holds vectors, run `.venv\Scripts\python -m graph_memory.migrate` (paid, resumable) before starting the API, which otherwise refuses to start. A model change that keeps the dimension needs a fresh database. Jev defaults to `typesafe/jev-1.13` and uses the dedicated `/api/alpha/decisions` endpoint.
 
 ```powershell
 docker compose up --build
