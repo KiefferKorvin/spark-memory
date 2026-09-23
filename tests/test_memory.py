@@ -343,6 +343,57 @@ async def test_root_breadth_and_navigation_floor():
     assert supervisor.explored == 2  # the two top-ranked candidates were still explored
 
 
+async def test_navigation_excerpts_only_for_retrievable_leaves():
+    from graph_memory.models import Assertion, Chunk, Document, Need, Section
+    from graph_memory.retrieval import ExplorationSupervisor, preview
+    from graph_memory.trace import TraceService
+    text = "First boil the chicken in cola, then fry it with flour and egg. " * 30
+    nodes = [Document(id="leaf", label="d", text=text, retrieval_leaf=True), Document(id="container", label="c", text=text),
+             Chunk(id="chunk", label="k", text=text, token_count=1, section_path=[], context_header="", order=0),
+             Assertion(id="assertion", label="a", text=text, proposition=text, confidence=.5),
+             Section(id="section", label="s", text=text, level=1, order=0, section_path=[]),
+             Concept(id="concept", label="Frying", preferred_label="Frying", description=text)]
+    views = {n.id: preview(n, excerpt_tokens=80) for n in nodes}
+    assert {i for i, v in views.items() if "excerpt" in v} == {"leaf", "chunk", "assertion"}
+    assert text.startswith(views["leaf"]["excerpt"]) and 70 <= token_count(views["leaf"]["excerpt"]) <= 80
+    assert "excerpt" not in preview(nodes[0])
+
+    class Spy(DemoModels):
+        payloads = []
+        async def navigate(self, payload, query_id):
+            self.payloads.append(payload)
+            return await super().navigate(payload, query_id)
+    repo = await hub_graph()
+    supervisor = ExplorationSupervisor(settings(navigation_excerpt_tokens=5), repo, Spy(), TraceService(repo, "q"))
+    await supervisor.explore([Need(id="N1", description="piano note")])
+    root = Spy.payloads[0]["candidate_children"]
+    assert all(("excerpt" in c) == (c["kind"] == "Document") for c in root) and any(c["kind"] == "Concept" for c in root)
+    assert all(token_count(c["excerpt"]) <= 5 for c in root if "excerpt" in c)
+
+
+async def test_navigation_request_shortens_excerpts_to_fit_budget():
+    from graph_memory.parsing import truncate
+    sent = []
+    async def handler(request):
+        body = json.loads(request.content); sent.append(body)
+        return httpx.Response(200, json={"answers": {k: {"type": "choice", "choice": "CONTINUE" if k == "branch_status" else "PRUNE"}
+                                                    for k in body["questions"]}})
+    def provider(budget):
+        return OpenRouter(settings(model_input_token_budget=budget), InMemoryGraph(), httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    # Worst case at candidate_limit=20: every candidate carries a full 80-token excerpt.
+    excerpt = truncate(" ".join(f"word{i}" for i in range(400)), 80)
+    state = {"information_need": {"id": "N1", "description": "crispy breading"}, "candidate_children": [
+        {"node_id": f"n{i}", "label": "note", "routing_summary": "Explore for frying notes."} for i in range(20)]}
+    await provider(100000).navigate(state, "q")
+    base = token_count(json.dumps(sent[-1], ensure_ascii=False))  # the same request without excerpts
+    full = {**state, "candidate_children": [{**c, "excerpt": excerpt} for c in state["candidate_children"]]}
+    budget = base + 600  # 20 x 80 excerpt tokens cannot fit; 20 x 20 can
+    await provider(budget).navigate(full, "q")
+    shortened = sent[-1]
+    assert token_count(json.dumps(shortened, ensure_ascii=False)) <= budget
+    assert all(0 < token_count(c["excerpt"]) < 80 and excerpt.startswith(c["excerpt"]) for c in shortened["state"]["candidate_children"])
+
+
 async def test_external_sources_are_explored_with_fresh_budget():
     # The first pass exhausts its node budget; newly ingested sources are still examined directly.
     memory = make_memory(max_total_nodes_explored=2)

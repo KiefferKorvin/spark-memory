@@ -10,20 +10,28 @@ from .models import (Answer, Branch, Coverage, CoverageItem, Decision, Decomposi
 from .parsing import truncate
 
 
-def preview(node, score=0):
+def preview(node, score=0, excerpt_tokens=0):
     # Routing summaries (not content summaries) drive navigation; keep the policy payload bounded.
-    return {"node_id": node.id, "label": node.label, "kind": node.kind,
+    view = {"node_id": node.id, "label": node.label, "kind": node.kind,
             "origin": getattr(node, "origin", None), "uri": getattr(node, "uri", None),
             "routing_summary": node.routing_summary,
             "aliases": getattr(node, "aliases", []), "score": score,
             "retrievable": bool(node.text) and (node.kind != "Document" or node.retrieval_leaf),
             "temporal_scope": node.metadata.get("temporal_scope")}
+    if excerpt_tokens and node.text and (node.kind in ("Chunk", "Assertion") or node.kind == "Document" and node.retrieval_leaf):
+        # A short leaf's opening text shows whether it answers the need far better than a routing summary.
+        # The character pre-cut bounds tokenizer work; 8 characters per token is a safe upper bound.
+        view["excerpt"] = truncate(node.text[:excerpt_tokens * 8], excerpt_tokens)
+    return view
 
 
-def trace_preview(node, score=0):
+def trace_preview(node, score=0, excerpt_tokens=0):
     """Compact preview for persisted/streamed events; the UI fetches full node details on selection."""
-    return {**preview(node, score), "routing_summary": node.routing_summary[:300],
+    view = {**preview(node, score, excerpt_tokens), "routing_summary": node.routing_summary[:300],
             "aliases": getattr(node, "aliases", [])[:5]}
+    if "excerpt" in view:
+        view["excerpt"] = view["excerpt"][:300]
+    return view
 
 
 class ExplorationSupervisor:
@@ -94,7 +102,8 @@ class ExplorationSupervisor:
         candidates = await self.repository.candidates(need.description, vector, self.settings.candidate_limit,
                                                       parent=branch.node_id)
         candidates = [(n, score) for n, score in candidates if (need.id, n.id) not in self.visited]
-        await self.trace.emit("CANDIDATES_GENERATED", branch, nodes=[trace_preview(n, s) for n, s in candidates])
+        excerpt = self.settings.navigation_excerpt_tokens
+        await self.trace.emit("CANDIDATES_GENERATED", branch, nodes=[trace_preview(n, s, excerpt) for n, s in candidates])
         if not candidates:
             branch.status = "COMPLETE" if branch.evidence_found else "DEAD_END"
             await self.trace.emit("BACKTRACK", branch, reason="no_unvisited_candidates")
@@ -103,8 +112,8 @@ class ExplorationSupervisor:
         # A root decision chooses a need's entry points among all index candidates; deeper ones stay narrow.
         breadth = self.settings.max_children_per_decision if branch.node_id else self.settings.max_root_children
         payload = {"information_need": need.model_dump(), "current_path": branch.path,
-                   "current_node": preview(current) if current else None,
-                   "candidate_children": [preview(n, s) for n, s in candidates],
+                   "current_node": preview(current, excerpt_tokens=excerpt) if current else None,
+                   "candidate_children": [preview(n, s, excerpt) for n, s in candidates],
                    "evidence_already_found": [{"id": e.id, "source_node_id": e.source_node_id,
                                                "information_need_ids": e.information_need_ids} for e in self.evidence.values()],
                    "remaining_budget": {"nodes": self.ceiling - self.explored,

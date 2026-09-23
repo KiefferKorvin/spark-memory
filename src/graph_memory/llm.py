@@ -154,10 +154,15 @@ class OpenRouter:
             return NavigationDecision(decisions=[Decision(node_id=c["node_id"], action=answers[f"node_{i}"]["choice"])
                                                   for i, c in enumerate(candidates)],
                                       current_node_action=answers["branch_status"]["choice"])
-        return await self.request("/api/alpha/decisions", {
-            "model": self.settings.navigation_model, "state": {**payload, "candidate_children": candidates},
-            "questions": questions,
-        }, "navigation", query_id, validate)
+        from .parsing import token_count, truncate
+        body = {"model": self.settings.navigation_model, "state": {**payload, "candidate_children": candidates},
+                "questions": questions}
+        # Excerpts are the elastic part of the state: halve them until the request fits rather than failing it.
+        while token_count(json.dumps(body, ensure_ascii=False)) > self.settings.model_input_token_budget and any(c.get("excerpt") for c in candidates):
+            candidates = [{**c, "excerpt": truncate(c["excerpt"], token_count(c["excerpt"]) // 2)} if c.get("excerpt") else c
+                          for c in candidates]
+            body["state"]["candidate_children"] = candidates
+        return await self.request("/api/alpha/decisions", body, "navigation", query_id, validate)
 
 
 def cited(answer, evidence):

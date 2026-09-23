@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     # Comma-separated online fallbacks for gaps in memory: wikipedia, pubmed, web (DuckDuckGo). Empty disables.
     external_retrievers: str = "wikipedia,pubmed,web"
     candidate_limit: int = Field(20, ge=1, le=100)
+    # Opening text of retrievable leaves shown to the navigation policy; shortened if the request would not fit.
+    navigation_excerpt_tokens: int = Field(80, ge=0, le=1000)
     max_parallel_branches: int = Field(6, ge=1, le=20)
     max_children_per_decision: int = Field(3, ge=1, le=100)
     # The root decision picks entry points for a whole need among the index candidates, so it may take more.
