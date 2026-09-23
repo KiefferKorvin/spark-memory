@@ -1,12 +1,32 @@
 import asyncio
-import logging
 
 from .llm import ProviderError
 from .models import Concept, ConceptSpec, Edge, ExternalConcept, Relation, Resolution, TaxonomyResolution, stable_id
 
-logger = logging.getLogger(__name__)
 # ponytail: fixed fan-out for classification calls; make it a setting if provider rate limits bite.
 CONCURRENCY = 6
+
+
+class Skip(ValueError):
+    """An unsound classification. `record` keeps why, what was proposed and how many candidates were shown.
+
+    Reasons: low_confidence, unknown_reuse_id, unanchored_reuse, no_parent, unknown_parent_id, no_anchor,
+    provider_error, invalid_concept."""
+    def __init__(self, reason, spec, decision=None, candidates=None):
+        super().__init__(f"{reason}: {spec.label}")
+        shown = candidates or {}
+
+        def named(i):
+            return {"id": i, "label": getattr(shown.get(i), "label", None)}
+        self.record = {"label": spec.label, "reason": reason, "confidence": decision.confidence if decision else None,
+                       "reuse": named(decision.reuse_id) if decision and decision.reuse_id else None,
+                       "parents": [named(i) for i in decision.parent_ids] if decision else [], "candidates": len(shown)}
+
+
+def skip_record(spec, exc):
+    if isinstance(exc, Skip):
+        return {**exc.record, "label": spec.label}  # a failed broader lookup is reported under its concept
+    return Skip("provider_error" if isinstance(exc, ProviderError) else "invalid_concept", spec).record
 
 
 class ConceptResolver:
@@ -37,7 +57,7 @@ class ConceptResolver:
             if decision.reuse_id:
                 matches = [n for n, _ in plausible if n.id == decision.reuse_id]
                 if not matches:
-                    raise ValueError("Concept resolver returned an unknown ID")
+                    raise Skip("unknown_reuse_id", spec)
                 matches[0].aliases = sorted(set(matches[0].aliases + spec.aliases + [spec.label]))
                 pending[matches[0].id] = matches[0]
                 return matches[0]
@@ -50,10 +70,11 @@ class ConceptResolver:
 
 
 class OntologyService:
-    """Links extracted concepts. Returns ({label_casefold: [concept, *anchors]}, edges, skipped_labels).
+    """Links extracted concepts. Returns ({label_casefold: [concept, *anchors]}, edges, skip records).
 
     A concept that cannot be classified soundly is skipped rather than rejecting its whole document:
     the text stays retrievable through fulltext/vector indexes and no orphan concept is created.
+    Each skip is a Skip.record, so a review sees the reason instead of a bare label.
     """
     def __init__(self, repository, models, threshold=0.75, authority="UNESCO"):
         self.repository = repository
@@ -77,8 +98,7 @@ class OntologyService:
                     if related.id != concept.id:
                         edges.append(Edge(source=concept.id, target=related.id, relation=Relation.RELATED_TO))
             except (ValueError, ProviderError) as exc:
-                logger.info("Concept %r skipped: %s", spec.label, exc)
-                skipped.append(spec.label)
+                skipped.append(skip_record(spec, exc))
                 continue
             resolved[spec.label.casefold()] = [concept]
         return resolved, edges, skipped
@@ -97,8 +117,7 @@ class OntologyService:
             remaining = [s for s in remaining if not any(s is l for l in layer)]
             for spec, result in zip(layer, await asyncio.gather(*map(classify, layer), return_exceptions=True)):
                 if isinstance(result, (ValueError, ProviderError)):
-                    logger.info("Concept %r skipped: %s", spec.label, result)
-                    skipped.append(spec.label)
+                    skipped.append(skip_record(spec, result))
                     continue
                 if isinstance(result, BaseException):
                     raise result
@@ -141,21 +160,23 @@ class OntologyService:
         decision = await self.models.structured("taxonomy_resolution", {
             "authority": self.authority, "candidate": spec.model_dump(), "existing": [dict(id=n.id, label=n.label, aliases=n.aliases, description=n.description, origin=n.origin) for n in candidates.values()]}, TaxonomyResolution, query_id)
         if decision.confidence < self.threshold:
-            raise ValueError(f"Ontology classification needs review: {spec.label}")
+            raise Skip("low_confidence", spec, decision, candidates)
         if decision.reuse_id:
             if decision.reuse_id not in candidates:
-                raise ValueError("Unknown taxonomy reuse ID")
+                raise Skip("unknown_reuse_id", spec, decision, candidates)
             concept = candidates[decision.reuse_id]
             anchors = await self.anchors_for(concept, pending)
             if not anchors:
-                raise ValueError("Unanchored local concept cannot be reused")
+                raise Skip("unanchored_reuse", spec, decision, candidates)
             return concept, anchors, [], []
-        if not decision.parent_ids or any(i not in candidates for i in decision.parent_ids):
-            raise ValueError("A local concept requires known taxonomy parents")
+        if not decision.parent_ids:
+            raise Skip("no_parent", spec, decision, candidates)
+        if any(i not in candidates for i in decision.parent_ids):
+            raise Skip("unknown_parent_id", spec, decision, candidates)
         for parent_id in decision.parent_ids:
             anchors += await self.anchors_for(candidates[parent_id], pending)
         if not anchors:
-            raise ValueError("A local concept must descend from the selected ontology")
+            raise Skip("no_anchor", spec, decision, candidates)
         concept = exact or Concept(id=stable_id("concept", ("" if self.authority == "UNESCO" else self.authority + ":") + spec.label.strip().casefold()), label=spec.label.strip(), preferred_label=spec.label.strip(), aliases=spec.aliases, description=spec.description, summary=spec.description, routing_summary=spec.description)
         concept.metadata["taxonomy_anchor_ids"] = sorted({n.id for n in anchors})
         parents = sorted(set(decision.parent_ids))

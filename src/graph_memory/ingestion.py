@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import weakref
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 from .models import Edge, Relation, Understanding, SourceMetadata, stable_id
 from .ontology import CONCURRENCY, OntologyService
@@ -56,7 +56,7 @@ class IngestionEngine:
             # The document hierarchy commits atomically first; it is retrievable without concept links.
             await self.repository.put([source, *parsed.nodes], [Edge(source=source.id, target=document_id, relation=Relation.PROVIDES), *parsed.edges])
             result = {"source_id": source.id, "document_id": document_id, "duplicate": False, "nodes_created": len(parsed.nodes)+1}
-            linking = self.link_concepts(parsed.nodes, understood, query_id)
+            linking = self.link_concepts(document_id, parsed.nodes, understood, query_id)
             if not defer_concepts:
                 return {**result, **await linking}
             # Taxonomy classification takes several model rounds; a waiting query should not pay for it.
@@ -65,8 +65,9 @@ class IngestionEngine:
             task.add_done_callback(self.linked)
             return {**result, "concepts": "deferred"}
 
-    async def link_concepts(self, nodes, understood, query_id=None):
-        """Resolve each distinct concept once per document (not once per chunk), then attach nodes with ABOUT."""
+    async def link_concepts(self, document_id, nodes, understood, query_id=None):
+        """Resolve each distinct concept once per document (not once per chunk), then attach nodes with ABOUT.
+        Skipped concepts are kept for review in the document's classification_review record."""
         specs = {}
         for understanding in understood.values():
             for spec in understanding.concepts:
@@ -77,7 +78,13 @@ class IngestionEngine:
             about = {c.id for spec in understood[node.id].concepts for c in resolved.get(spec.label.casefold(), [])}
             edges.extend(Edge(source=node.id, target=i, relation=Relation.ABOUT) for i in sorted(about))
         await self.repository.put(list(pending.values()), edges)
-        return {"concepts_linked": len(pending), "unclassified_concepts": skipped}
+        reasons = Counter(s["reason"] for s in skipped)
+        if skipped:
+            await self.repository.record("classification_review", document_id, {"document_id": document_id, "skipped": skipped})
+            logger.warning("Document %s: %d of %d concepts not classified (%s)", document_id, len(skipped), len(specs),
+                           ", ".join(f"{reason} {count}" for reason, count in reasons.most_common()))
+        return {"concepts_linked": len(pending), "concepts_extracted": len(specs),
+                "unclassified_concepts": [s["label"] for s in skipped], "classification_skips": dict(reasons)}
 
     def linked(self, task):
         self.background.discard(task)

@@ -14,9 +14,9 @@ MEMORY = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(MEMORY / "src"))
 from graph_memory.config import Settings  # noqa: E402
 from graph_memory.graph import Neo4jGraph  # noqa: E402
-from graph_memory.llm import OpenRouter  # noqa: E402
+from graph_memory.llm import OpenRouter, ProviderError  # noqa: E402
 from graph_memory.models import Understanding  # noqa: E402
-from graph_memory.ontology import OntologyService  # noqa: E402
+from graph_memory.ontology import OntologyService, skip_record  # noqa: E402
 from graph_memory.parsing import truncate  # noqa: E402
 
 RUN = Path(__file__).resolve().parent / "runs" / (sys.argv[1] if len(sys.argv) > 1 else "preview")
@@ -52,8 +52,10 @@ async def main():
     async def classify(spec, pending, query_id=None):
         try:
             concept, anchors, extra, edges = await original(spec, pending, query_id)
-        except ValueError as exc:
-            outcomes.append({"label": spec.label, "broader": spec.broader, "outcome": str(exc), "decision": models.decisions.get(spec.label)})
+        except (ValueError, ProviderError) as exc:
+            # The same reason code ingestion persists in its classification_review records.
+            outcomes.append({"label": spec.label, "broader": spec.broader, "outcome": skip_record(spec, exc)["reason"],
+                             "decision": models.decisions.get(spec.label)})
             raise
         how = "exact UNESCO label" if concept.origin == "UNESCO" and not models.decisions.get(spec.label) else \
               "reused UNESCO concept" if concept.origin == "UNESCO" else "new LOCAL child"
@@ -83,7 +85,7 @@ async def main():
         await models.inner.close()
         await repo.close()
     OUT.write_text(json.dumps(outcomes, indent=1, ensure_ascii=False), encoding="utf-8")
-    reasons = Counter(o["outcome"] if not o["outcome"].startswith("Ontology classification needs review") else "confidence below threshold" for o in outcomes)
+    reasons = Counter(o["outcome"] for o in outcomes)
     print(f"\n{len(outcomes)} concepts from {len(sample)} documents")
     for reason, n in reasons.most_common():
         print(f"  {n:3}  {100*n/len(outcomes):4.0f}%  {reason}")

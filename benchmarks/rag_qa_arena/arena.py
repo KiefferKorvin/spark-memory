@@ -445,7 +445,8 @@ async def ingest(args, run, memory, corpus):
                                                            metadata={"bench_doc_id": doc["id"], "domain": doc["domain"]}))
                 row = {"doc_id": doc["id"], "kg_document_id": result["document_id"], "duplicate": result["duplicate"],
                        "nodes": result.get("nodes_created"), "concepts": result.get("concepts_linked"),
-                       "unclassified": len(result.get("unclassified_concepts") or [])}
+                       "unclassified": len(result.get("unclassified_concepts") or []),
+                       "extracted": result.get("concepts_extracted"), "skips": result.get("classification_skips")}
             except Exception as exc:
                 row = {"doc_id": doc["id"], "error": f"{type(exc).__name__}: {exc}"[:300]}
                 if not run.halted:

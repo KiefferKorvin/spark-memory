@@ -23,6 +23,8 @@ Interactive OpenAPI documentation: `/docs`. Every endpoint accepts `Authorizatio
 | GET | `/memory/metrics` | Aggregate inference counts, tokens and reported costs |
 | POST | `/memory/demo/seed` | Synthetic dataset, available only in demo mode |
 
+Ingestion returns `source_id`, `document_id` and `duplicate`; a new document also returns `nodes_created`, `concepts_extracted` (distinct concepts found), `concepts_linked` (concept nodes written, including taxonomy anchors), `unclassified_concepts` (skipped labels) and `classification_skips` (`{reason: count}`, see [ingestion](INGESTION.md)). Sources ingested during a query return `"concepts": "deferred"` instead. The per-concept skip details are kept in the `classification_review` record of the document.
+
 Ingestion accepts `title`, exactly one of `text`, `content_base64`, `url`, and optional `mime_type`, `filename`, `source_type`, `author`, `published_at`, `metadata`. Example DOCX/PDF ingestion: base64 encode bytes client-side, supply the corresponding MIME type and sanitized filename metadata. Unsupported/invalid source formats return 422. Oversized HTTP bodies return 413; limits also apply to decoded content and remote responses.
 
 Query accepts `query` and `allow_external` (default true). Capacity exhaustion returns 429. Completed results include `answer`, valid `evidence_ids`, original `evidence`, final `context`, per-need `coverage`, `branches` and `nodes_explored`. Insufficient coverage is a completed retrieval outcome, not automatically a server error.

@@ -4,7 +4,8 @@ import pytest
 from rdflib import Graph
 
 from graph_memory.graph import InMemoryGraph
-from graph_memory.models import ConceptSpec, Edge, Relation, TaxonomyResolution
+from graph_memory.llm import ProviderError
+from graph_memory.models import Concept, ConceptSpec, Edge, Relation, TaxonomyResolution
 from graph_memory.ontology import OntologyService
 from graph_memory.unesco import parse_thesaurus
 
@@ -105,7 +106,7 @@ async def test_uncertain_classification_is_skipped_without_orphan(taxonomy):
     pending = {}
     # One unclassifiable concept must not reject the whole document; it is reported and left unlinked.
     linked, edges, skipped = await OntologyService(repo, Uncertain()).link([ConceptSpec(label='unknown'), ConceptSpec(label='Music')], pending)
-    assert skipped == ['unknown'] and [n.label for n in linked['music']] == ['Musique']
+    assert [(k['label'], k['reason']) for k in skipped] == [('unknown', 'low_confidence')] and [n.label for n in linked['music']] == ['Musique']
     assert not edges and all(n.origin == 'UNESCO' for n in pending.values())
     assert len(repo.nodes) == 4
 
@@ -128,4 +129,47 @@ async def test_document_ingestion_creates_about_and_deduplicates(taxonomy):
     before = len(repo.nodes), len(repo.edges)
     assert (await memory.ingest(request))['duplicate']
     assert (len(repo.nodes), len(repo.edges)) == before
+    await memory.close()
+
+
+def decide(reuse=None, parents=(), confidence=.9):
+    return lambda ids: TaxonomyResolution(reuse_id=ids.get(reuse, reuse), parent_ids=[ids.get(p, p) for p in parents], confidence=confidence)
+
+
+@pytest.mark.parametrize('reason,label,decision', [
+    ('low_confidence', 'unknown', decide(parents=['Musique'], confidence=.2)),
+    ('unknown_reuse_id', 'unknown', decide(reuse='invented')),
+    ('unanchored_reuse', 'Orphan', decide(reuse='Orphan')),
+    ('no_parent', 'unknown', decide()),
+    ('unknown_parent_id', 'unknown', decide(parents=['invented'])),
+    ('no_anchor', 'Orphan', decide(parents=['Orphan'])),
+    ('provider_error', 'unknown', None),
+])
+async def test_skip_records_name_their_reason(taxonomy, reason, label, decision):
+    repo = await loaded(taxonomy)
+    await repo.put([Concept(id='orphan', label='Orphan', preferred_label='Orphan')], [])  # LOCAL, no UNESCO anchor
+    class Model:
+        async def structured(self, operation, payload, schema, query_id=None):
+            if decision is None:
+                raise ProviderError('unavailable')
+            return decision({e['label']: e['id'] for e in payload['existing']})
+    _, edges, skipped = await OntologyService(repo, Model()).link([ConceptSpec(label=label, broader=['Music'])], {})
+    assert [(k['label'], k['reason']) for k in skipped] == [(label, reason)] and not edges
+    if reason == 'low_confidence':
+        assert skipped[0]['confidence'] == .2 and [p['label'] for p in skipped[0]['parents']] == ['Musique']
+        assert skipped[0]['candidates'] >= 1 and skipped[0]['reuse'] is None
+
+
+async def test_ingestion_reports_and_persists_skips(taxonomy):
+    from graph_memory.config import Settings
+    from graph_memory.demo import DemoModels
+    from graph_memory.models import IngestRequest
+    from graph_memory.service import Memory
+    memory = Memory(Settings(memory_mode='demo', _env_file=None), await loaded(taxonomy), DemoModels())
+    # Demo concepts: Music is an exact UNESCO label; Acoustics (broader Science) has no parent in this thesaurus.
+    result = await memory.ingest(IngestRequest(title='Note', text='Acoustics and music.'))
+    assert result['concepts_extracted'] == 2 and result['classification_skips'] == {'low_confidence': 1}
+    assert result['unclassified_concepts'] == ['Acoustics']
+    review = await memory.repository.read_record('classification_review', result['document_id'])
+    assert [k['label'] for k in review['skipped']] == ['Acoustics'] and review['skipped'][0]['confidence'] == 0
     await memory.close()
