@@ -59,7 +59,8 @@ class Settings(BaseSettings):
     max_external_sources: int = Field(6, ge=0, le=20)
     max_external_rounds: int = Field(1, ge=0, le=3)
     max_active_queries: int = Field(4, ge=1, le=20)
-    query_timeout_seconds: float = Field(180, ge=1, le=3600)
+    # External sources are ingested and indexed before retrieval resumes.
+    query_timeout_seconds: float = Field(600, ge=1, le=3600)
     provider_timeout_seconds: float = Field(45, ge=1, le=300)
     provider_retries: int = Field(2, ge=0, le=4)
     enrichment_enabled: bool = True

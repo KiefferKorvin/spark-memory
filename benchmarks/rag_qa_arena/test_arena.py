@@ -98,12 +98,16 @@ async def spend_cap_stops_the_run():
 asyncio.run(spend_cap_stops_the_run())
 
 # Answer standards: under "reference" every method gets the reference's own length as its limit, in the v2 sentence.
-from arena import CLOSED_V2, V2_LIMIT, bounded, word_limit  # noqa: E402
+from arena import CLOSED_V2, STRICT, V2_LIMIT, answer_prompt, bounded, word_limit  # noqa: E402
 reference = "one two three four five six seven"
 assert word_limit("reference", reference) == 7 and word_limit("50-60", reference) == 60 and word_limit("unbounded", reference) is None
 limited = bounded(CLOSED_V2.format(q="why?"), "reference", reference)
 assert limited.endswith("Your answer should not be longer than 7 words.") and V2_LIMIT not in limited
 assert bounded(CLOSED_V2.format(q="why?"), "50-60", reference).endswith(V2_LIMIT)
+V2 = "Passages:\n{x.passages}\nQuery: {x.question}\nBased on the passages, answer. " + V2_LIMIT
+strict = answer_prompt(V2, [{"text": "p1"}], "why?", "reference", reference)
+assert "<passage1>\np1\n</passage>" in strict and "Query: why?" in strict and strict.endswith(STRICT + "Your answer should not be longer than 7 words.")
+assert STRICT not in answer_prompt(V2, [{"text": "p1"}], "why?", "50-60", reference)  # the published v2 standard stays as is
 try:
     bounded("a v1 prompt without the sentence", "reference", reference)
     raise AssertionError("a template without the v2 length sentence must not silently go unbounded")

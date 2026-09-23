@@ -70,10 +70,14 @@ CLOSED_V2 = ("Provide a helpful answer to the query. Query is in the <query></qu
 CLOSED_V1 = ("Provide a helpful answer to the query. Query is in the <query></query> tags.\n\n<query>\n{q}\n</query>\n\n"
              "First, think step by step, and put your thinking in <thinking> tags. Your thinking must be shorter than "
              "50 words. Then, provide your answer.")
-# CLI alias -> (name recorded in state.json, answer template, closed-book prompt)
-STANDARDS = {"reference": ("reference length (ans_generation_v2.cfg)", "ans_generation_v2.cfg", CLOSED_V2),
-             "50-60": ("ans_generation_v2.cfg (50-60 words)", "ans_generation_v2.cfg", CLOSED_V2),
-             "unbounded": ("ans_generation_v1.cfg (unbounded)", "ans_generation_v1.cfg", CLOSED_V1)}
+# Added before the length sentence of passage prompts: in the oracle test it cut wrong answers from 4 to 1 and
+# unsupported claims from 11 to 6 (same model), by stopping dropped qualifiers, misattribution and outside facts.
+STRICT = ("State only what the passages say: keep their qualifiers (such as 'generally' or 'sometimes'), attribute each "
+          "fact to exactly what the passage says it applies to, and add no names, numbers or facts that the passages do not state. ")
+# CLI alias -> (name recorded in state.json, answer template, closed-book prompt, strict passage prompts)
+STANDARDS = {"reference": ("reference length + strict (ans_generation_v2.cfg)", "ans_generation_v2.cfg", CLOSED_V2, True),
+             "50-60": ("ans_generation_v2.cfg (50-60 words)", "ans_generation_v2.cfg", CLOSED_V2, False),
+             "unbounded": ("ans_generation_v1.cfg (unbounded)", "ans_generation_v1.cfg", CLOSED_V1, False)}
 
 
 def word_limit(standard, reference):
@@ -88,6 +92,17 @@ def bounded(prompt, standard, reference):
     if V2_LIMIT not in prompt:
         raise ValueError("answer prompt lacks the ans_generation_v2.cfg length sentence")
     return prompt.replace(V2_LIMIT, f"Your answer should not be longer than {word_limit(standard, reference)} words.")
+
+
+def answer_prompt(template, chosen, question, standard, reference):
+    """The passage-method answer prompt: the benchmark template, this question's length limit and, under the
+    reference standard, the strictness sentence before it."""
+    prompt = template.replace("{x.passages}", "".join(f"<passage{i+1}>\n{p['text']}\n</passage>\n" for i, p in enumerate(chosen)))
+    prompt = bounded(prompt.replace("{x.question}", question), standard, reference)
+    return prompt.replace("Your answer should not be longer than", STRICT + "Your answer should not be longer than", 1) if STANDARDS[standard][3] else prompt
+
+
+
 # Judges' hidden reasoning effort (--judge-reasoning) and the output cap it needs: reasoning tokens count against
 # max_tokens, and GLM 5.3 cannot disable reasoning at all (HTTP 400). Models without reasoning ignore the setting.
 JUDGE_TOKENS = {"minimal": 1500, "low": 4096, "medium": 8192, "high": 16384}
@@ -95,6 +110,7 @@ JUDGE_TOKENS = {"minimal": 1500, "low": 4096, "medium": 8192, "high": 16384}
 JUDGED = ("grounding", "correctness")
 PRODUCED_BY = {"answer_model": ("answers", *JUDGED), "answer_standard": ("answers", *JUDGED), "embedding_model": ("answers", *JUDGED),
                "grounding_judge": ("grounding",), "correctness_judge": ("correctness",), "correctness_prompt": ("correctness",),
+               "grounding_prompt": ("grounding",),
                "judge_reasoning": JUDGED}
 
 
@@ -218,9 +234,11 @@ def kg_passages(texts, k):
 
 
 # --- Groundedness: an extra measure; the arena's pairwise judge never sees the sources ---
+GROUNDING_VERSION = "2"  # recorded per run, so verdicts of another prompt version are never mixed
 GROUNDING = ("You check an answer against the passages it was written from. Split the answer into its distinct factual "
-             "claims (advice, hedges and restatements of the question are not claims). For each claim decide whether the "
-             "passages state or directly imply it; general knowledge that the passages lack is unsupported. "
+             "claims (advice, hedges and restatements of the question are not claims). A claim is supported when the "
+             "passages state it, say the same in other words, or it follows directly from them; it is unsupported only when "
+             "the passages do not contain it or contradict it. General knowledge that the passages lack is unsupported. "
              'Return JSON only: {"claims": [{"claim": "...", "supported": true}]}')
 
 
@@ -325,10 +343,12 @@ class OpenRouter:
             await asyncio.sleep(min(30, 2 ** attempt))
         raise RuntimeError(f"{path}: {error}")
 
-    async def chat(self, model, messages, max_tokens, options=None, pace=None):
+    async def chat(self, model, messages, max_tokens, options=None, pace=None, provider=False):
+        """(content, cost), plus the provider that served it when asked."""
         obj = await self.post("/chat/completions", {**(options or {}), "model": model, "messages": messages,
                                                      "max_tokens": max_tokens, "temperature": 0}, pace)
-        return obj["choices"][0]["message"].get("content") or "", (obj.get("usage") or {}).get("cost") or 0
+        result = obj["choices"][0]["message"].get("content") or "", (obj.get("usage") or {}).get("cost") or 0
+        return (*result, obj.get("provider")) if provider else result
 
     async def embed(self, model, texts):
         vectors = []
@@ -461,7 +481,7 @@ async def main(args):
                         external_retrievers="", **overrides)
     produced = {"answer_model": settings.synthesis_model, "answer_standard": STANDARDS[args.answer_standard][0],
                 "embedding_model": settings.embedding_model, "grounding_judge": args.grounding_judge,
-                "correctness_judge": args.correctness_judge, "correctness_prompt": CORRECTNESS_VERSION,
+                "correctness_judge": args.correctness_judge, "correctness_prompt": CORRECTNESS_VERSION, "grounding_prompt": GROUNDING_VERSION,
                 "judge_reasoning": args.judge_reasoning}
     if refusal := mixed_rows(HERE / "runs" / args.run, produced, args.redo, args.rejudge):
         raise SystemExit(refusal)
@@ -563,12 +583,11 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
     qvectors = dict(zip([q["qid"] for q in questions], await client.embed(settings.embedding_model, [q["question"] for q in questions])))
     texts = {d["id"]: d["text"] for d in corpus}
     standard = args.answer_standard
-    _, answer_file, closed_prompt = STANDARDS[standard]
+    _, answer_file, closed_prompt, _ = STANDARDS[standard]
     answer_template = template(args.arena, answer_file)
 
     async def rag(q, chosen):
-        prompt = answer_template.replace("{x.passages}", "".join(f"<passage{i+1}>\n{p['text']}\n</passage>\n" for i, p in enumerate(chosen)))
-        prompt = bounded(prompt.replace("{x.question}", q["question"]), standard, q["reference"])
+        prompt = answer_prompt(answer_template, chosen, q["question"], standard, q["reference"])
         text, cost = await client.chat(settings.synthesis_model, [{"role": "user", "content": prompt}],
                                        args.answer_tokens, settings.openrouter_options)
         return {"pred": process_response(text), "cost": cost, "retrieved": [d for d in dict.fromkeys(p["doc"] for p in chosen) if d]}
@@ -644,16 +663,22 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
     kg_slots = min(args.kg_concurrency, settings.max_active_queries)  # Memory.submit rejects beyond its cap.
     gates = {m: asyncio.Semaphore(kg_slots if m == "kg_memory" else args.concurrency) for m in methods}
     ground_pace, grade_pace = pacer(args.judge_rpm), pacer(args.judge_rpm)
-    # Price-weighted routing picked slow providers that cap output near 4k tokens: high reasoning then used it all
-    # (657 s, empty verdict). Throughput routing avoids them, and an empty or malformed verdict is asked again.
+    # Some providers stop output near 4k tokens whatever they advertise, so high reasoning can use it all and leave
+    # an empty verdict (seen: 657 s, 4,246 reasoning tokens). An empty or malformed verdict is asked again without
+    # the provider that served it; throughput routing also keeps slow providers away.
     judge_options = {"reasoning": {"effort": args.judge_reasoning, "exclude": True}, "provider": {"sort": "throughput"}}
 
     async def verdict(model, messages, parse, pace):
+        avoid = []
         for attempt in range(3):
-            text, cost = await client.chat(model, messages, judge_tokens, {**judge_options, "response_format": {"type": "json_object"}}, pace=pace)
+            options = {**judge_options, "response_format": {"type": "json_object"},
+                       "provider": {**judge_options["provider"], **({"ignore": avoid} if avoid else {})}}
+            text, cost, served = await client.chat(model, messages, judge_tokens, options, pace=pace, provider=True)
             try:
                 return parse(text), cost
             except (ValueError, KeyError, TypeError):
+                if served:
+                    avoid.append(served)
                 if attempt == 2:
                     raise
     judge_tokens = JUDGE_TOKENS[args.judge_reasoning]
