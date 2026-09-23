@@ -15,7 +15,8 @@ class IngestionEngine:
     def __init__(self, settings, repository, models):
         self.settings, self.repository, self.models = settings, repository, models
         self.sources = SourceService(settings)
-        self.ontology = OntologyService(repository, models, settings.taxonomy_match_threshold, settings.primary_ontology)
+        self.ontology = OntologyService(repository, models, settings.taxonomy_match_threshold, settings.primary_ontology,
+                                        settings.embedding_model)
         # Per-document locks avoid duplicate inference for identical content while unrelated
         # documents (e.g. several external sources found by one query) ingest concurrently.
         self.locks = weakref.WeakValueDictionary()

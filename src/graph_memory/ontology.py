@@ -76,11 +76,12 @@ class OntologyService:
     the text stays retrievable through fulltext/vector indexes and no orphan concept is created.
     Each skip is a Skip.record, so a review sees the reason instead of a bare label.
     """
-    def __init__(self, repository, models, threshold=0.75, authority="UNESCO"):
+    def __init__(self, repository, models, threshold=0.75, authority="UNESCO", embedding_model=""):
         self.repository = repository
-        self.authority = authority
+        self.authority, self.embedding_model = authority, embedding_model
         self.models, self.threshold = models, threshold
         self.resolver = ConceptResolver(repository, models)
+        self.semantic = False
 
     async def link(self, specs, pending, query_id=None):
         if await self.repository.read_record("taxonomy", self.authority):
@@ -104,6 +105,9 @@ class OntologyService:
         return resolved, edges, skipped
 
     async def link_taxonomy(self, specs, pending, query_id=None):
+        # Semantic candidates only once the thesaurus is embedded with this model (unesco --embed).
+        embedded = await self.repository.read_record("taxonomy_embedding", self.authority)
+        self.semantic = bool(embedded) and embedded["model"] == self.embedding_model
         resolved, edges, skipped = {}, [], []
         remaining, gate = list(specs), asyncio.Semaphore(CONCURRENCY)
 
@@ -143,8 +147,10 @@ class OntologyService:
         anchors = await self.anchors_for(exact, pending) if exact else []
         if exact and anchors:
             return exact, anchors, [], []
-        query = " ".join([spec.label, spec.description, *spec.broader, *spec.related])
-        candidates = {n.id: n for n in await self.repository.taxonomy_candidates(query, authority=self.authority)}
+        # The label and broader labels name the concept; free-text descriptions mostly add generic words.
+        query = " ".join([spec.label, *spec.broader])
+        vector = await self.models.embed(". ".join([spec.label, ", ".join(spec.broader), spec.description])[:1000], query_id) if self.semantic else None
+        candidates = {n.id: n for n in await self.repository.taxonomy_candidates(query, 20, self.authority, vector)}
         local_matches = [n for n, score in await self.repository.candidates(query, [], 12, kind="Concept") if n.origin == "LOCAL" and score > 0]
         from .graph import rank
         local_matches += sorted(pending.values(), key=lambda n: -rank(n, query, []))[:12]

@@ -1,9 +1,10 @@
 """Property graph stores. The in-memory adapter is exclusively for tests/demo."""
 import asyncio
+import itertools
 import json
 import math
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Protocol
 
 from .models import Edge, Node, Relation, node_from, now
@@ -22,6 +23,25 @@ STOP = set("a an and are as at be by can do does for from how i in is it of on o
 def terms(text: str) -> set[str]:
     tokens = words(text)
     return tokens - STOP or tokens
+
+
+def taxonomy_terms(query, frequencies, size):
+    """Lexical taxonomy query: words that label many thesaurus entries ("technique", "non") are dropped unless
+    all are, and each kept word also matches its naive singular/plural form ("foods" finds "food")."""
+    # ponytail: 0.5% document-frequency cut and English/French "s" plurals; use a stemming analyzer if this misfires.
+    tokens = sorted(terms(query), key=lambda t: (frequencies.get(t, 0), t))
+    kept = [t for t in tokens if frequencies.get(t, 0) <= max(5, size / 200)] or tokens[:1]
+    return sorted({form for t in kept for form in (t, t[:-1] if len(t) > 3 and t.endswith("s") else t + "s")})
+
+
+def interleave(rankings, limit):
+    """Round-robin merge without duplicates, so semantic and lexical candidates both reach the classifier."""
+    merged = {}
+    for group in itertools.zip_longest(*rankings):
+        for node in group:
+            if node is not None:
+                merged.setdefault(node.id, node)
+    return list(merged.values())[:limit]
 
 
 # Imported taxonomy entries without attached content are dead ends for evidence retrieval.
@@ -55,7 +75,9 @@ class GraphRepository(Protocol):
     async def neighbors(self, node_id: str, limit: int = 100) -> tuple[list[Node], list[Edge]]: ...
     async def exact_concept(self, label: str, authority: str | None = None) -> Node | None: ...
     async def import_taxonomy(self, nodes, edges, manifest): ...
-    async def taxonomy_candidates(self, query: str, limit: int = 12, authority: str = "UNESCO"): ...
+    async def taxonomy_candidates(self, query: str, limit: int = 12, authority: str = "UNESCO", vector=None): ...
+    async def taxonomy_concepts(self, authority: str = "UNESCO") -> list[tuple[Node, str | None]]: ...
+    async def set_ontology_embeddings(self, rows: list[tuple[str, str, list[float]]]): ...
     async def taxonomy_roots(self, authority="UNESCO"): ...
     async def taxonomy_ancestors(self, node_id: str, authority: str = "UNESCO"): ...
     async def unesco_ancestors(self, node_id: str): ...
@@ -136,6 +158,8 @@ class InMemoryGraph:
         self.edges = {}
         self.data = {}
         self.stats = defaultdict(lambda: {"navigation_hits": 0, "successful_retrievals": 0})
+        # Taxonomy embeddings live apart from node embeddings, like Neo4j's separate ontology_vector index.
+        self.ontology_vectors = {}
         self.lock = asyncio.Lock()
 
     async def initialize(self):
@@ -181,9 +205,22 @@ class InMemoryGraph:
             self.nodes, self.edges = merged, links
             await self.record("taxonomy", manifest["authority"], manifest)
 
-    async def taxonomy_candidates(self, query, limit=12, authority="UNESCO"):
+    async def taxonomy_candidates(self, query, limit=12, authority="UNESCO", vector=None):
         nodes = [n for n in self.nodes.values() if n.kind == "Concept" and n.origin == authority]
-        return sorted(nodes, key=lambda n: (-rank(n, query, []), n.id))[:limit]
+        frequencies = Counter(t for n in nodes for t in words(n.label + " " + " ".join(n.aliases)))
+        wanted = " ".join(taxonomy_terms(query, frequencies, len(nodes)))
+        lexical = sorted((n for n in nodes if rank(n, wanted, []) > 0), key=lambda n: (-rank(n, wanted, []), n.id))
+        semantic = sorted((n for n in nodes if vector and n.id in self.ontology_vectors),
+                          key=lambda n: (-cosine(self.ontology_vectors[n.id][1], vector), n.id))
+        return interleave([semantic[:limit], lexical[:limit]], limit)
+
+    async def taxonomy_concepts(self, authority="UNESCO"):
+        return [(n.model_copy(deep=True), self.ontology_vectors.get(n.id, (None,))[0])
+                for n in self.nodes.values() if n.kind == "Concept" and n.origin == authority]
+
+    async def set_ontology_embeddings(self, rows):
+        for node_id, key, vector in rows:
+            self.ontology_vectors[node_id] = (key, vector)
 
     async def taxonomy_roots(self, authority="UNESCO"):
         groups = [n for n in self.nodes.values() if n.kind == "TaxonomyGroup" and n.origin == authority and n.group_type == "domain"]
@@ -264,6 +301,7 @@ class Neo4jGraph:
         # Schema hints (e.g. "CONTRADICTS does not exist yet") would otherwise log a warning per provenance query.
         self.driver = AsyncGraphDatabase.driver(settings.neo4j_uri, auth=(
             settings.neo4j_username, settings.neo4j_password.get_secret_value()), notifications_min_severity="OFF")
+        self.frequencies = {}
 
     async def run(self, cypher, **parameters):
         records, _, _ = await self.driver.execute_query(
@@ -281,6 +319,9 @@ class Neo4jGraph:
             "CREATE FULLTEXT INDEX ontology_text IF NOT EXISTS FOR (n:ImportedConcept) ON EACH [n.label,n.aliases,n.routing_summary]",
             "CREATE FULLTEXT INDEX memory_text IF NOT EXISTS FOR (n:MemoryNode) ON EACH [n.label, n.text, n.routing_summary, n.aliases]",
             "CREATE VECTOR INDEX memory_vector IF NOT EXISTS FOR (n:MemoryNode) ON (n.embedding) OPTIONS {indexConfig: {`vector.dimensions`: "
+            + str(self.settings.embedding_dimensions) + ", `vector.similarity_function`: 'cosine'}}",
+            # A separate property and index: thesaurus embeddings must never crowd memory_vector's content hits.
+            "CREATE VECTOR INDEX ontology_vector IF NOT EXISTS FOR (n:ImportedConcept) ON (n.ontology_embedding) OPTIONS {indexConfig: {`vector.dimensions`: "
             + str(self.settings.embedding_dimensions) + ", `vector.similarity_function`: 'cosine'}}",
         ]:
             await self.run(statement)
@@ -379,9 +420,28 @@ class Neo4jGraph:
         async with self.driver.session(database=self.settings.neo4j_database) as session:
             await session.execute_write(write)
 
-    async def taxonomy_candidates(self, query, limit=12, authority="UNESCO"):
-        rows = await self.run("CALL db.index.fulltext.queryNodes('ontology_text',$query) YIELD node,score WHERE node.origin=$authority RETURN node.payload AS payload ORDER BY score DESC LIMIT $limit", query=" OR ".join(sorted(terms(query))[:80]) or "__no_terms__", limit=limit, authority=authority)
-        return [node_from(json.loads(r['payload'])) for r in rows]
+    async def taxonomy_candidates(self, query, limit=12, authority="UNESCO", vector=None):
+        if authority not in self.frequencies:
+            rows = await self.run("MATCH (n:ImportedConcept) WHERE n.origin=$authority RETURN n.label AS label, n.aliases AS aliases", authority=authority)
+            self.frequencies[authority] = len(rows), Counter(t for r in rows for t in words(r["label"] + " " + " ".join(r["aliases"] or [])))
+        size, frequencies = self.frequencies[authority]
+        query = " OR ".join(taxonomy_terms(query, frequencies, size)[:80]) or "__no_terms__"
+        rows = await self.run("CALL db.index.fulltext.queryNodes('ontology_text',$query) YIELD node,score WHERE node.origin=$authority RETURN node.payload AS payload ORDER BY score DESC LIMIT $limit", query=query, limit=limit, authority=authority)
+        lexical = [node_from(json.loads(r['payload'])) for r in rows]
+        semantic = []
+        if vector:
+            rows = await self.run("CALL db.index.vector.queryNodes('ontology_vector',$k,$vector) YIELD node,score WHERE node.origin=$authority RETURN node.payload AS payload ORDER BY score DESC", k=limit, vector=vector, authority=authority)
+            semantic = [node_from(json.loads(r['payload'])) for r in rows]
+        return interleave([semantic, lexical], limit)
+
+    async def taxonomy_concepts(self, authority="UNESCO"):
+        rows = await self.run("MATCH (n:ImportedConcept) WHERE n.origin=$authority RETURN n.payload AS payload, n.ontology_embedding_key AS key", authority=authority)
+        return [(node_from(json.loads(r["payload"])), r["key"]) for r in rows]
+
+    async def set_ontology_embeddings(self, rows):
+        await self.run("UNWIND $rows AS row MATCH (n:MemoryNode {id:row.id}) WHERE n:ImportedConcept "
+                       "SET n.ontology_embedding=row.vector, n.ontology_embedding_key=row.key",
+                       rows=[{"id": i, "key": key, "vector": vector} for i, key, vector in rows])
 
     async def taxonomy_roots(self, authority="UNESCO"):
         rows = await self.run("MATCH (n:ImportedTaxonomy) WHERE n.origin=$authority AND NOT EXISTS { MATCH (:ImportedTaxonomy)-[:HAS_MEMBER|BROADER_THAN]->(n) } RETURN n.payload AS payload ORDER BY n.label LIMIT 100", authority=authority)

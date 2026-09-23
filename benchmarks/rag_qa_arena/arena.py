@@ -43,6 +43,7 @@ sys.path.insert(0, str(MEMORY / "src"))
 from graph_memory.config import Settings  # noqa: E402
 from graph_memory.models import IngestRequest, QueryRequest  # noqa: E402
 from graph_memory.service import Memory  # noqa: E402
+from graph_memory.unesco import embed_taxonomy  # noqa: E402
 
 DOMAINS = ["lifestyle", "recreation", "science", "technology", "writing"]
 METHODS = ["closed_book", "bm25_rag", "dense_rag", "oracle_rag", "kg_memory", "kg_context"]
@@ -411,6 +412,8 @@ async def main(args):
             (run.dir / "ingested.jsonl").unlink(missing_ok=True)
         run.log("initializing graph memory (Neo4j schema, UNESCO import)")
         await memory.initialize()
+        # Semantic classification candidates; idempotent, so only a fresh graph pays (cents).
+        run.log(f"thesaurus embeddings: {await embed_taxonomy(memory.repository, memory.models, settings)}")
         await ingest(args, run, memory, corpus)
         if not run.halted:
             await evaluate(args, run, memory, client, settings, questions, corpus)

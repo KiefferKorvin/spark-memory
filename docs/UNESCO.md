@@ -57,9 +57,16 @@ Culture → Performing arts → Music.
 ## Indexation progressive
 
 Pour chaque concept extrait d'un document, le résolveur cherche d'abord un
-libellé ou synonyme existant, en privilégiant UNESCO. Un index plein texte dédié
-cherche ensuite les concepts UNESCO dans toutes les langues, et fournit une
-sélection bornée au modèle sémantique. Celui-ci choisit un concept équivalent à
+libellé ou synonyme existant, en privilégiant UNESCO. Deux recherches fournissent
+ensuite au modèle sémantique une sélection bornée (20 concepts, alternés) :
+l'index plein texte, interrogé avec le libellé et les parents proposés (sans la
+description libre), sans les mots trop fréquents du thésaurus et avec les formes
+singulier/pluriel ; et, une fois le thésaurus vectorisé, l'index vectoriel dédié
+`ontology_vector` (libellés dans la langue d'affichage et en anglais, note
+d'application). La vectorisation est une étape séparée et payante, reprenable et
+idempotente, qui ne revectorise que les concepts modifiés ou un nouveau modèle :
+`.venv/Scripts/python.exe -m graph_memory.unesco --embed`. Ces vecteurs ont leur
+propre propriété et n'entrent jamais dans la recherche de contenu. Le modèle sémantique choisit un concept équivalent à
 réutiliser ou les parents les plus proches pour un nouveau concept LOCAL.
 Les concepts locaux existants et les parents explicitement proposés sont aussi
 considérés. Plusieurs parents sont permis ; les dépendances locales sont

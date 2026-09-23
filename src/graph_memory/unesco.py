@@ -10,6 +10,7 @@ from pathlib import Path
 from rdflib import Graph, Literal, Namespace, RDF, SKOS, URIRef
 
 from .models import Concept, Edge, Relation, TaxonomyGroup, stable_id
+from .parsing import truncate
 
 BASE = "http://vocabularies.unesco.org/thesaurus/"
 SCHEME = BASE.rstrip("/")
@@ -150,14 +151,66 @@ async def import_thesaurus(repository, path, language="fr"):
     return taxonomy.manifest
 
 
+def concept_text(node, language):
+    """What an imported concept means, for its ontology embedding: labels in the display language and English
+    (the thesaurus is multilingual, extracted concepts mostly English), then its scope note, bounded."""
+    labels = [node.label, *(v for lang in dict.fromkeys([language, "en"]) for v in node.pref_labels.get(lang, []) + node.alt_labels.get(lang, []))]
+    note = preferred(node.descriptions, language)
+    return truncate(" ; ".join(dict.fromkeys(labels)) + (". " + note if note else ""), 200)
+
+
+async def embed_taxonomy(repository, models, settings, authority=None, batch=32):
+    """Embeds imported concepts for semantic classification candidates. The import itself stays model-free.
+
+    Resumable and idempotent: each concept stores a key of its text and the embedding model, so a rerun embeds
+    only concepts that are new, changed or embedded with another model."""
+    authority = authority or settings.primary_ontology
+    stamp = f"{settings.embedding_model}:{settings.embedding_dimensions}"
+    concepts, todo = await repository.taxonomy_concepts(authority), []
+    for node, key in concepts:
+        text = concept_text(node, settings.unesco_label_language)
+        wanted = hashlib.sha256(f"{stamp}:{text}".encode()).hexdigest()[:24]
+        if key != wanted:
+            todo.append((node.id, wanted, text))
+    for start in range(0, len(todo), batch):
+        part = todo[start:start + batch]
+        vectors = await models.embed_batch([text for _, _, text in part])
+        await repository.set_ontology_embeddings([(i, key, v) for (i, key, _), v in zip(part, vectors)])
+    await repository.record("taxonomy_embedding", authority, {"model": settings.embedding_model,
+                                                               "dimensions": settings.embedding_dimensions, "concepts": len(concepts)})
+    return {"authority": authority, "concepts": len(concepts), "embedded": len(todo)}
+
+
 async def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("path", help="Local UNESCO .ttl/.rdf file or directory")
+    parser.add_argument("path", nargs="?", help="Local UNESCO .ttl/.rdf file or directory to import")
+    parser.add_argument("--embed", action="store_true",
+                        help="Embed imported concepts for classification (paid embeddings; resumable, skips unchanged)")
     parser.add_argument("--language", default="fr")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--verify-formats", action="store_true", help="Compare .ttl and .rdf semantic content")
     parser.add_argument("--report", help="Write import manifest as JSON")
     args = parser.parse_args()
+    if not args.path and not args.embed:
+        parser.error("give a thesaurus path to import, --embed, or both")
+    if args.path:
+        await import_command(args)
+    if args.embed:
+        from .config import Settings
+        from .graph import Neo4jGraph
+        from .llm import OpenRouter
+        settings = Settings()
+        repository = Neo4jGraph(settings)
+        models = OpenRouter(settings, repository)
+        try:
+            await repository.initialize()
+            print(json.dumps(await embed_taxonomy(repository, models, settings), indent=2))
+        finally:
+            await models.close()
+            await repository.close()
+
+
+async def import_command(args):
     taxonomy = parse_thesaurus(args.path, args.language)
     if args.verify_formats:
         root = Path(args.path) if Path(args.path).is_dir() else Path(args.path).parent

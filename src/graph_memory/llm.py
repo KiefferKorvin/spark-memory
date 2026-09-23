@@ -20,6 +20,7 @@ T = TypeVar("T", bound=BaseModel)
 class ModelProvider(Protocol):
     async def structured(self, operation: str, payload: dict, schema: type[T], query_id: str | None = None) -> T: ...
     async def embed(self, text: str, query_id: str | None = None) -> list[float]: ...
+    async def embed_batch(self, texts: list[str], query_id: str | None = None) -> list[list[float]]: ...
     async def navigate(self, payload: dict, query_id: str) -> NavigationDecision: ...
     async def close(self): ...
 
@@ -118,21 +119,31 @@ class OpenRouter:
         cached = self.cached(key)
         if cached is not None:
             return list(cached)
-
-        def validate(obj):
-            vector = obj["data"][0]["embedding"]
-            if len(vector) != self.settings.embedding_dimensions or not all(
-                type(x) in (int, float) and math.isfinite(x) for x in vector
-            ) or not any(vector):
-                raise ValueError("Invalid embedding dimensions or values")
-            return vector
-
         vector = await self.request("/api/v1/embeddings", {
             "model": self.settings.embedding_model, "input": text,
             "dimensions": self.settings.embedding_dimensions,
-        }, "embedding", query_id, validate)
+        }, "embedding", query_id, lambda obj: self.vector(obj["data"][0]["embedding"]))
         self.save_cache(key, vector)
         return vector
+
+    async def embed_batch(self, texts, query_id=None):
+        """One request for many texts, for bulk jobs such as embedding a thesaurus; not cached."""
+        def validate(obj):
+            rows = sorted(obj["data"], key=lambda r: r["index"])
+            if len(rows) != len(texts):
+                raise ValueError("Embedding count differs from input count")
+            return [self.vector(r["embedding"]) for r in rows]
+        return await self.request("/api/v1/embeddings", {
+            "model": self.settings.embedding_model, "input": texts,
+            "dimensions": self.settings.embedding_dimensions,
+        }, "embedding", query_id, validate)
+
+    def vector(self, value):
+        if len(value) != self.settings.embedding_dimensions or not all(
+            type(x) in (int, float) and math.isfinite(x) for x in value
+        ) or not any(value):
+            raise ValueError("Invalid embedding dimensions or values")
+        return value
 
     async def navigate(self, payload, query_id):
         candidates = payload["candidate_children"][:self.settings.candidate_limit]

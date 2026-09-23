@@ -173,3 +173,52 @@ async def test_ingestion_reports_and_persists_skips(taxonomy):
     review = await memory.repository.read_record('classification_review', result['document_id'])
     assert [k['label'] for k in review['skipped']] == ['Acoustics'] and review['skipped'][0]['confidence'] == 0
     await memory.close()
+
+
+FOOD_TTL = '''@prefix s: <http://www.w3.org/2004/02/skos/core#> .
+@prefix u: <http://vocabularies.unesco.org/thesaurus/> .
+u:food a s:Concept; s:prefLabel "Aliment"@fr, "Food"@en; s:altLabel "Foodstuffs"@en .
+u:sport a s:Concept; s:prefLabel "Sport"@fr, "Sports"@en .
+''' + "".join(f'u:tech{i} a s:Concept; s:prefLabel "Technique {name}"@fr, "{name} technique"@en .\n'
+              for i, name in enumerate(["de conservation", "de laboratoire", "musicale", "de vente", "agricole", "de gestion"]))
+
+
+class Meanings:
+    """Deterministic embedder with a few hand-made meanings, enough to tell food from technique."""
+    SENSES = {"crispy": 0, "frying": 0, "fry": 0, "food": 0, "foodstuffs": 0, "aliment": 0,
+              "technique": 1, "tennis": 2, "sport": 2, "sports": 2}
+
+    async def embed(self, text, query_id=None):
+        from graph_memory.graph import words
+        vector = [0.0, 0.0, 0.0, 0.01]  # words without a listed meaning carry none
+        for word in words(text) & self.SENSES.keys():
+            vector[self.SENSES[word]] += 1
+        return vector
+
+    async def embed_batch(self, texts, query_id=None):
+        return [await self.embed(t) for t in texts]
+
+
+async def test_semantic_taxonomy_candidates_beat_lexical_noise(tmp_path):
+    from graph_memory.config import Settings
+    from graph_memory.unesco import embed_taxonomy
+    path = tmp_path / 'food.ttl'
+    path.write_text(FOOD_TTL, encoding='utf-8')
+    repo = await loaded(parse_thesaurus(path))
+    settings = Settings(memory_mode='demo', _env_file=None)
+    assert (await embed_taxonomy(repo, Meanings(), settings))['embedded'] == 8
+    assert (await embed_taxonomy(repo, Meanings(), settings))['embedded'] == 0  # resumable: unchanged texts skipped
+    # Thesaurus vectors live apart from content retrieval: empty entries never become memory candidates.
+    assert not await repo.candidates('food', await Meanings().embed('food'), 10)
+    shown = []
+    class Spy(Meanings):
+        async def structured(self, operation, payload, schema, query_id=None):
+            shown.append([e['label'] for e in payload['existing']])
+            return TaxonomyResolution(reuse_id=None, parent_ids=[], confidence=0)
+    await OntologyService(repo, Spy(), embedding_model=settings.embedding_model).link(
+        [ConceptSpec(label='Crispy Frying Technique', broader=['Frying'], description='A method of frying foods to obtain a crispy texture')], {})
+    labels = shown[0]
+    assert labels[0] == 'Aliment' and labels.index('Aliment') < min(i for i, l in enumerate(labels) if l.startswith('Technique'))
+    # Lexical side: a plural still finds its singular label ("Foodstuffs" -> "Food"), and generic words are cut.
+    from graph_memory.graph import taxonomy_terms
+    assert 'food' in taxonomy_terms('foods', {}, 10) and taxonomy_terms('technique crispy', {'technique': 40}, 4500) == ['crispy', 'crispys']

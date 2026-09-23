@@ -42,6 +42,9 @@ class DemoModels:
         norm = math.sqrt(sum(v*v for v in vector)) or 1
         return [v / norm for v in vector]
 
+    async def embed_batch(self, texts, query_id=None):
+        return [await self.embed(text, query_id) for text in texts]
+
     async def structured(self, operation, payload, schema, query_id=None):
         await asyncio.sleep(0)
         if operation == "source_metadata":
