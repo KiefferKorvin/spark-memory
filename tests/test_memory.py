@@ -417,6 +417,21 @@ async def test_original_question_reaches_candidate_search_and_relevance():
     assert Models.relevance and all(p["question"] == question for p in Models.relevance)
 
 
+async def test_answer_length_cap_per_query_overrides_the_setting():
+    from graph_memory.models import QueryRequest
+    class Models(DemoModels):
+        limits = []
+        async def structured(self, operation, payload, schema, query_id=None):
+            if operation == "synthesis":
+                self.limits.append(payload.get("answer_max_words"))
+            return await super().structured(operation, payload, schema, query_id)
+    memory = Memory(settings(answer_max_words=60), InMemoryGraph(), Models())
+    await seed(memory)
+    await memory.query(QueryRequest(query="piano keys", allow_external=False))
+    await memory.query(QueryRequest(query="piano keys", allow_external=False, answer_max_words=84))
+    assert Models.limits == [60, 84]
+
+
 async def test_reembedding_after_a_dimension_change_is_resumable():
     from graph_memory.ingestion import embedding_text
     from graph_memory.migrate import reembed

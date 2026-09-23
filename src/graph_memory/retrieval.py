@@ -276,8 +276,10 @@ class RetrievalEngine:
         await trace.emit("FINAL_CONTEXT_BUILT", evidence_ids=[e["id"] for e in context])
         await trace.emit("ANSWER_GENERATION_STARTED")
         try:
+            limit = request.answer_max_words or self.settings.answer_max_words
             answer = await self.models.structured("synthesis", {"query": request.query,
-                "coverage": coverage.model_dump(), "evidence": context}, Answer, trace.query_id)
+                "coverage": coverage.model_dump(), "evidence": context, **({"answer_max_words": limit} if limit else {})},
+                Answer, trace.query_id)
             # Cited IDs are whatever known evidence the answer actually cites inline.
             answer.evidence_ids = cited(answer.answer, context)
             if context and not answer.evidence_ids:

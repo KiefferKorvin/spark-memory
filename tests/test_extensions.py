@@ -81,10 +81,11 @@ async def test_synthesis_uses_requested_model_and_repairs_invalid_citations():
     assert '[E1]' in result.answer and len(calls) == 2
     assert all(c['model'] == 'z-ai/glm-5.3-flash' for c in calls)
     assert not calls[0]['messages'][0]['content'].endswith('citations.')  # no answer length cap by default
-    capped = OpenRouter(Settings(_env_file=None, memory_mode='demo', answer_max_words=60), InMemoryGraph(), httpx.AsyncClient(transport=httpx.MockTransport(respond)))
+    capped = OpenRouter(Settings(_env_file=None, memory_mode='demo'), InMemoryGraph(), httpx.AsyncClient(transport=httpx.MockTransport(respond)))
     calls.clear()
-    await capped.structured('synthesis', {'evidence':[{'id':'E1','text':'Evidence'}]}, Answer)
+    await capped.structured('synthesis', {'evidence':[{'id':'E1','text':'Evidence'}], 'answer_max_words': 60}, Answer)
     assert calls[0]['messages'][0]['content'].endswith('Your answer should not be longer than 60 words, not counting citations.')
+    assert 'answer_max_words' not in calls[0]['messages'][1]['content']  # an instruction, not user data
     await capped.close()
     await hybrid.close()
 

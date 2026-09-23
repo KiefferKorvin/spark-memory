@@ -91,6 +91,9 @@ class OpenRouter:
 
     async def structured(self, operation, payload, schema, query_id=None):
         model = self.settings.synthesis_model if operation == "synthesis" else self.settings.semantic_model
+        # A synthesis length cap is an instruction for the system prompt, not data in the user message.
+        limit = payload.get("answer_max_words", 0) if operation == "synthesis" else 0
+        payload = {k: v for k, v in payload.items() if k != "answer_max_words"}
         serial = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         key = hashlib.sha256(f"{VERSION}:{model}:{operation}:{schema.model_json_schema()}:{serial}".encode()).hexdigest()
         reusable = operation in {"understanding", "resolution"}
@@ -105,7 +108,7 @@ class OpenRouter:
             return value
         result = await self.request("/api/v1/chat/completions", {
             **self.settings.openrouter_options, "model": model,
-            "messages": [{"role": "system", "content": prompt(operation, self.settings.answer_max_words if operation == "synthesis" else 0)},
+            "messages": [{"role": "system", "content": prompt(operation, limit)},
                          {"role": "user", "content": serial}],
             "response_format": {"type": "json_schema", "json_schema": {
                 "name": schema.__name__, "strict": True, "schema": strict_schema(schema.model_json_schema())}},

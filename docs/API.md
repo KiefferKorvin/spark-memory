@@ -27,7 +27,7 @@ Ingestion returns `source_id`, `document_id` and `duplicate`; a new document als
 
 Ingestion accepts `title`, exactly one of `text`, `content_base64`, `url`, and optional `mime_type`, `filename`, `source_type`, `author`, `published_at`, `metadata`. Example DOCX/PDF ingestion: base64 encode bytes client-side, supply the corresponding MIME type and sanitized filename metadata. Unsupported/invalid source formats return 422. Oversized HTTP bodies return 413; limits also apply to decoded content and remote responses.
 
-Query accepts `query` and `allow_external` (default true). Capacity exhaustion returns 429. Completed results include `answer`, valid `evidence_ids`, original `evidence`, final `context`, per-need `coverage`, `branches` and `nodes_explored`. Insufficient coverage is a completed retrieval outcome, not automatically a server error.
+Query accepts `query`, `allow_external` (default true) and optional `answer_max_words`, which caps this answer's length and overrides `ANSWER_MAX_WORDS`. Capacity exhaustion returns 429. Completed results include `answer`, valid `evidence_ids`, original `evidence`, final `context`, per-need `coverage`, `branches` and `nodes_explored`. Insufficient coverage is a completed retrieval outcome, not automatically a server error.
 
 SSE uses persisted event sequence numbers and supports `Last-Event-ID`. Clients may reconnect without losing events or poll the event endpoint. `event: done` indicates terminal persisted query state. Unknown IDs return 404; malformed cursors return 422. Event records include event UUID, query UUID, timestamp, type, optional node/branch/parent/need IDs and structured metadata.
 

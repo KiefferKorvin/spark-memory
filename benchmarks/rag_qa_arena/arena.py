@@ -4,10 +4,13 @@ Faithful to the benchmark: RobustQA/LoTTE test collections, LFRQA reference answ
 templates, and the pairwise judge against LFRQA with the benchmark's own system prompt, few-shot examples,
 answer ordering and rating parser. Methods share one answer model and one mixed corpus.
 
-Every method answers under one length standard, the benchmark's `ans_generation_v2.cfg` ("not longer than 50-60
-words"), and the graph memory's own synthesis gets the same cap (ANSWER_MAX_WORDS=60): the judge prefers "more
-truthful or helpful information", so unequal lengths would be scored instead of retrieval. --unbounded-answers
-restores the paper's `ans_generation_v1.cfg` without caps.
+Every method answers under one length standard, because the judge prefers "more truthful or helpful information"
+and would otherwise score length instead of retrieval. --answer-standard picks it:
+  reference  (default) the benchmark's `ans_generation_v2.cfg` with its "50-60 words" set, per question, to the length
+             of that question's LFRQA reference, so no method is out-worded by the reference either
+  50-60      `ans_generation_v2.cfg` as published; the graph memory's synthesis is capped at 60 words
+  unbounded  the paper's `ans_generation_v1.cfg`, no cap
+The graph memory gets the same limit through QueryRequest.answer_max_words.
 
 Subset: `--per-domain` questions per LoTTE domain; the corpus is their gold documents plus `--negatives`
 BM25 hard negatives per question mined from the full domain collection (BM25 retrieves over the same corpus,
@@ -57,15 +60,31 @@ GROUNDED = ["bm25_rag", "dense_rag", "oracle_rag", "kg_memory", "kg_context"]  #
 NO_ANSWER = "I couldn't find an answer."
 STOP = set("a an the of to in on for and or is are was were be been it its this that with as by at from how what why "
            "when where which who whom do does did can could should would will i you my your me we our not no if so".split())
+V2_LIMIT = "Your answer should not be longer than 50-60 words."  # closing sentence of ans_generation_v2.cfg
 # Closed-book prompts mirror the passage templates of the same standard, without passages.
-STANDARDS = {
-    "ans_generation_v2.cfg (50-60 words)": ("ans_generation_v2.cfg", 60, "Provide a helpful answer to the query. Query is in "
-        "the <query></query> tags.\n\n<query>\n{q}\n</query>\n\nProvide a helpful answer to the query. "
-        "Your answer should not be longer than 50-60 words."),
-    "ans_generation_v1.cfg (unbounded)": ("ans_generation_v1.cfg", 0, "Provide a helpful answer to the query. Query is in "
-        "the <query></query> tags.\n\n<query>\n{q}\n</query>\n\nFirst, think step by step, and put your thinking in "
-        "<thinking> tags. Your thinking must be shorter than 50 words. Then, provide your answer."),
-}
+CLOSED_V2 = ("Provide a helpful answer to the query. Query is in the <query></query> tags.\n\n<query>\n{q}\n</query>\n\n"
+             "Provide a helpful answer to the query. " + V2_LIMIT)
+CLOSED_V1 = ("Provide a helpful answer to the query. Query is in the <query></query> tags.\n\n<query>\n{q}\n</query>\n\n"
+             "First, think step by step, and put your thinking in <thinking> tags. Your thinking must be shorter than "
+             "50 words. Then, provide your answer.")
+# CLI alias -> (name recorded in state.json, answer template, closed-book prompt)
+STANDARDS = {"reference": ("reference length (ans_generation_v2.cfg)", "ans_generation_v2.cfg", CLOSED_V2),
+             "50-60": ("ans_generation_v2.cfg (50-60 words)", "ans_generation_v2.cfg", CLOSED_V2),
+             "unbounded": ("ans_generation_v1.cfg (unbounded)", "ans_generation_v1.cfg", CLOSED_V1)}
+
+
+def word_limit(standard, reference):
+    """The answer length cap of one question under a standard, identical for every method; None means no cap."""
+    return len(reference.split()) if standard == "reference" else 60 if standard == "50-60" else None
+
+
+def bounded(prompt, standard, reference):
+    """Sets the v2 length sentence of an answer prompt to this question's limit."""
+    if standard != "reference":
+        return prompt
+    if V2_LIMIT not in prompt:
+        raise ValueError("answer prompt lacks the ans_generation_v2.cfg length sentence")
+    return prompt.replace(V2_LIMIT, f"Your answer should not be longer than {word_limit(standard, reference)} words.")
 # GLM 5.3 cannot disable reasoning (HTTP 400); its tokens count against max_tokens, so judges get room beyond the
 # benchmark's 256. Models without reasoning ignore this.
 MINIMAL_REASONING = {"reasoning": {"effort": "minimal", "exclude": True}}
@@ -407,16 +426,14 @@ async def reset_graph(repository):
 async def main(args):
     if args.reset_graph and (refusal := reset_refusal(args.neo4j_uri, Settings(_env_file=MEMORY / ".env").neo4j_uri)):
         raise SystemExit(refusal)
-    standard = next(name for name in STANDARDS if ("v1" in name) == args.unbounded_answers)
     overrides = dict(kv.split("=", 1) for kv in args.kg_setting)
-    overrides.setdefault("answer_max_words", STANDARDS[standard][1])
     # A dedicated benchmark key keeps a runaway run from exhausting the live app's spend cap.
     key = os.environ.get("ARENA_OPENROUTER_API_KEY") or dotenv_values(MEMORY / ".env").get("ARENA_OPENROUTER_API_KEY")
     if key:
         overrides["openrouter_api_key"] = key
     settings = Settings(_env_file=MEMORY / ".env", neo4j_uri=args.neo4j_uri, neo4j_password=args.neo4j_password,
                         external_retrievers="", **overrides)
-    produced = {"answer_model": settings.synthesis_model, "answer_standard": standard,
+    produced = {"answer_model": settings.synthesis_model, "answer_standard": STANDARDS[args.answer_standard][0],
                 "embedding_model": settings.embedding_model, "judge": args.judge, "grounding_judge": args.grounding_judge}
     if refusal := mixed_rows(HERE / "runs" / args.run, produced, args.redo):
         raise SystemExit(refusal)
@@ -437,7 +454,7 @@ async def main(args):
                                kg={k: getattr(settings, k) for k in ("max_total_nodes_explored", "max_depth", "max_parallel_branches",
                                    "max_children_per_decision", "max_root_children", "min_root_children", "candidate_limit", "navigation_excerpt_tokens",
                                    "taxonomy_match_threshold", "taxonomy_provisional_threshold",
-                                   "context_token_budget", "answer_max_words", "query_timeout_seconds")})
+                                   "context_token_budget", "query_timeout_seconds")})
     client = OpenRouter(settings.openrouter_api_key.get_secret_value())
     memory = Memory.from_settings(settings)
     watch_spend_cap(memory.models.client, run)
@@ -517,8 +534,9 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
     vectors = await client.embed(settings.embedding_model, [p["text"] for p in psgs])
     qvectors = dict(zip([q["qid"] for q in questions], await client.embed(settings.embedding_model, [q["question"] for q in questions])))
     texts = {d["id"]: d["text"] for d in corpus}
-    answer_template, _, closed_prompt = STANDARDS[run.state["config"]["answer_standard"]]
-    answer_template = template(args.arena, answer_template)
+    standard = args.answer_standard
+    _, answer_file, closed_prompt = STANDARDS[standard]
+    answer_template = template(args.arena, answer_file)
     pair_template = template(args.arena, "pairwise_lfrqa.cfg")
     system = (args.arena / "templates" / "pairwise_lfrqa_system.txt").read_text(encoding="utf-8")
     examples = json.loads((args.arena / "templates" / "pairwise_lfrqa_examples.json").read_text(encoding="utf-8"))
@@ -531,12 +549,13 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
 
     async def rag(q, chosen):
         prompt = answer_template.replace("{x.passages}", "".join(f"<passage{i+1}>\n{p['text']}\n</passage>\n" for i, p in enumerate(chosen)))
-        text, cost = await client.chat(settings.synthesis_model, [{"role": "user", "content": prompt.replace("{x.question}", q["question"])}],
+        prompt = bounded(prompt.replace("{x.question}", q["question"]), standard, q["reference"])
+        text, cost = await client.chat(settings.synthesis_model, [{"role": "user", "content": prompt}],
                                        args.answer_tokens, settings.openrouter_options)
         return {"pred": process_response(text), "cost": cost, "retrieved": [d for d in dict.fromkeys(p["doc"] for p in chosen) if d]}
 
     async def closed_book(q):
-        text, cost = await client.chat(settings.synthesis_model, [{"role": "user", "content": closed_prompt.format(q=q["question"])}],
+        text, cost = await client.chat(settings.synthesis_model, [{"role": "user", "content": bounded(closed_prompt.format(q=q["question"]), standard, q["reference"])}],
                                        args.answer_tokens, settings.openrouter_options)
         return {"pred": process_response(text), "cost": cost}
 
@@ -550,7 +569,8 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
               "oracle_rag": lambda q: [{"doc": g, "text": texts[g]} for g in q["gold"]]}
 
     async def kg_memory(q):
-        result = await memory.query(QueryRequest(query=q["question"], allow_external=False))
+        result = await memory.query(QueryRequest(query=q["question"], allow_external=False,
+                                                 answer_max_words=word_limit(standard, q["reference"])))
         usage = [u for u in await memory.repository.records("usage") if u.get("query_id") == result["query_id"]]
         extra = {"query_id": result["query_id"], "status": result.get("status"), "calls": len(usage),
                  "cost": sum(u.get("estimated_cost") or 0 for u in usage)}
@@ -705,8 +725,8 @@ if __name__ == "__main__":
     parser.add_argument("--judge", default="z-ai/glm-5.3-flash", help="paper: gpt-4-0125-preview; the default limits cost")
     parser.add_argument("--judge-rpm", type=float, default=18, help="judge requests per minute (OpenRouter new-account cap is 20)")
     parser.add_argument("--grounding-judge", default="z-ai/glm-5.3-flash", help="checks answer claims against the passages used")
-    parser.add_argument("--unbounded-answers", action="store_true",
-                        help="the paper's ans_generation_v1.cfg and no synthesis cap, instead of the 50-60 word standard")
+    parser.add_argument("--answer-standard", default="reference", choices=list(STANDARDS),
+                        help="answer length for every method: each LFRQA reference's length, 50-60 words, or unbounded")
     parser.add_argument("--skip-judge", action="store_true", help="answers and retrieval metrics only; judge later")
     parser.add_argument("--reset-graph", action="store_true", help="wipe the benchmark graph and re-ingest (never the live one)")
     parser.add_argument("--passages", type=int, default=5)

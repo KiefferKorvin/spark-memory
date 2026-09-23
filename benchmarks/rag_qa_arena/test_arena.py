@@ -93,6 +93,19 @@ async def spend_cap_stops_the_run():
 
 asyncio.run(spend_cap_stops_the_run())
 
+# Answer standards: under "reference" every method gets the reference's own length as its limit, in the v2 sentence.
+from arena import CLOSED_V2, V2_LIMIT, bounded, word_limit  # noqa: E402
+reference = "one two three four five six seven"
+assert word_limit("reference", reference) == 7 and word_limit("50-60", reference) == 60 and word_limit("unbounded", reference) is None
+limited = bounded(CLOSED_V2.format(q="why?"), "reference", reference)
+assert limited.endswith("Your answer should not be longer than 7 words.") and V2_LIMIT not in limited
+assert bounded(CLOSED_V2.format(q="why?"), "50-60", reference).endswith(V2_LIMIT)
+try:
+    bounded("a v1 prompt without the sentence", "reference", reference)
+    raise AssertionError("a template without the v2 length sentence must not silently go unbounded")
+except ValueError:
+    pass
+
 # A run never mixes cached rows made with another answer model, answer standard or judge into one leaderboard.
 with tempfile.TemporaryDirectory() as root:
     old = Path(root) / "old"

@@ -284,6 +284,7 @@ class Answer(Strict):
 class QueryRequest(Strict):
     query: str = Field(min_length=1, max_length=5000)
     allow_external: bool = True
+    answer_max_words: int | None = Field(None, ge=1, le=2000)  # overrides ANSWER_MAX_WORDS for this query
     original_sources_only: bool = False
 
 
