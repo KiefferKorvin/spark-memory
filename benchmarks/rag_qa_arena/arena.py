@@ -105,7 +105,9 @@ def answer_prompt(template, chosen, question, standard, reference):
 
 # Judges' hidden reasoning effort (--judge-reasoning) and the output cap it needs: reasoning tokens count against
 # max_tokens, and GLM 5.3 cannot disable reasoning at all (HTTP 400). Models without reasoning ignore the setting.
-JUDGE_TOKENS = {"minimal": 1500, "low": 4096, "medium": 8192, "high": 16384}
+# OpenRouter reserves each in-flight request's maximum cost against the credit left, so this cap is kept near the
+# longest verdict seen (about 8k tokens at high effort).
+JUDGE_TOKENS = {"minimal": 1500, "low": 4096, "medium": 8192, "high": 12288}
 # Which cached rows each recorded setting produced: a changed judge invalidates its verdicts, not the answers.
 JUDGED = ("grounding", "correctness")
 PRODUCED_BY = {"answer_model": ("answers", *JUDGED), "answer_standard": ("answers", *JUDGED), "embedding_model": ("answers", *JUDGED),
@@ -303,9 +305,14 @@ class SpendCap(RuntimeError):
     """The key's spend cap or credits are exhausted: fatal for the whole run, not for one item."""
 
 
+def reserved(status, text):
+    """HTTP 402 because in-flight requests reserve the remaining credit: temporary, retry once they settle."""
+    return status == 402 and "in-flight" in text.lower()
+
+
 def spend_cap(status, text):
     # 403 also covers moderation refusals; only budget wording is fatal.
-    return status == 402 or status == 403 and any(w in text.lower() for w in ("limit", "credit"))
+    return status == 402 and not reserved(status, text) or status == 403 and any(w in text.lower() for w in ("limit", "credit"))
 
 
 def watch_spend_cap(client, run):
@@ -336,7 +343,7 @@ class OpenRouter:
                 error = f"HTTP {response.status_code}: {response.text[:200]}"
                 if spend_cap(response.status_code, response.text):
                     raise SpendCap(error)
-                if response.status_code in (400, 401, 402, 403, 404):
+                if response.status_code in (400, 401, 402, 403, 404) and not reserved(response.status_code, response.text):
                     break
             except (httpx.HTTPError, ValueError) as exc:
                 error = type(exc).__name__

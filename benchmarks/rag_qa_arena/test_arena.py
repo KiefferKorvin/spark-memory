@@ -8,7 +8,7 @@ import httpx
 import json
 
 from arena import (BM25, NO_ANSWER, OpenRouter, Run, SpendCap, context_texts, kg_passages, mine, mixed_rows, parse_correctness, parse_grounding,
-                   passages, process_response, reset_refusal, watch_spend_cap, without_citations)
+                   passages, process_response, reset_refusal, spend_cap, watch_spend_cap, without_citations)
 
 assert process_response("<thinking>short</thinking>\nThe answer.") == "The answer."
 assert process_response("Thought: x Answer: The answer.") == "The answer."
@@ -59,6 +59,11 @@ try:
     raise AssertionError("malformed verdict must raise so a rerun retries it")
 except ValueError:
     pass
+
+
+# Credit reserved by in-flight requests is a temporary 402, retried; exhausted credit or a key limit stops the run.
+INFLIGHT = '{"error":{"message":"This request would exceed your available credits given your current in-flight requests. Retry after in-flight requests settle, or add credits.","code":402}}'
+assert not spend_cap(402, INFLIGHT) and spend_cap(402, '{"error":{"message":"Insufficient credits"}}') and spend_cap(403, "Key limit exceeded")
 
 
 async def spend_cap_stops_the_run():

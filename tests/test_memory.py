@@ -266,6 +266,18 @@ async def test_concurrent_submit_capacity_and_query_timeout():
     assert result["status"] == "failed" and "timed out" in result["error"]
 
 
+async def test_credit_reserved_by_in_flight_requests_is_retried():
+    calls = []
+    async def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(402, json={"error": {"message": "This request would exceed your available credits given your current in-flight requests. Retry after in-flight requests settle, or add credits."}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({"document_type": "note", "summary": "s", "routing_summary": "r"})}}]})
+    provider = OpenRouter(settings(provider_retries=1), InMemoryGraph(), httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    assert (await provider.structured("understanding", {"text": "x"}, Understanding)).summary == "s" and len(calls) == 2
+    await provider.close()
+
+
 async def test_bad_provider_choices_retry_then_fail():
     calls = []
     async def bad(request):

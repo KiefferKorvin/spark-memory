@@ -65,7 +65,9 @@ class OpenRouter:
                     headers={"Authorization": "Bearer " + self.settings.openrouter_api_key.get_secret_value(),
                              "X-Title": "Progressive Graph Memory"})
                 if not 200 <= response.status_code < 300:
-                    retryable = response.status_code in (408, 429) or response.status_code >= 500
+                    # 402 "retry after in-flight requests settle": credit is reserved by concurrent requests, not spent.
+                    retryable = response.status_code in (408, 429) or response.status_code >= 500 or (
+                        response.status_code == 402 and "in-flight" in response.text.lower())
                     raise ProviderError(f"Model provider HTTP {response.status_code}")
                 obj = response.json()
                 usage = obj.get("usage") or {}
