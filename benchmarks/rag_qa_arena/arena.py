@@ -777,9 +777,9 @@ if __name__ == "__main__":
     parser.add_argument("--redo", nargs="*", default=[], choices=METHODS,
                         help="discard cached answers and verdicts of these methods (kg_memory implies kg_context)")
     parser.add_argument("--judge-rpm", type=float, default=18, help="requests per minute for each judge (OpenRouter new-account cap is 20)")
-    parser.add_argument("--grounding-judge", default="z-ai/glm-5.3-flash", help="checks answer claims against the passages used")
-    parser.add_argument("--correctness-judge", default="z-ai/glm-5.3-flash", help="grades each answer as correct or not against its reference")
-    parser.add_argument("--judge-reasoning", default="minimal", choices=list(JUDGE_TOKENS), help="hidden reasoning effort of all three judges")
+    parser.add_argument("--grounding-judge", default="deepseek/deepseek-v4.1-flash", help="checks answer claims against the passages used")
+    parser.add_argument("--correctness-judge", default="deepseek/deepseek-v4.1-flash", help="grades each answer as correct or not against its reference")
+    parser.add_argument("--judge-reasoning", default="high", choices=list(JUDGE_TOKENS), help="hidden reasoning effort of both judges")
     parser.add_argument("--rejudge", nargs="*", choices=JUDGED, default=None,
                         help="discard cached verdicts of these judges (all when none are named) and grade the cached answers again")
     parser.add_argument("--answer-standard", default="reference", choices=list(STANDARDS),

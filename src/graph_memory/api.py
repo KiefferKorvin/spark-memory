@@ -77,6 +77,16 @@ def create_app(memory=None):
     async def ingest(body: IngestRequest, request: Request):
         return await service(request).ingest(body)
 
+    @app.get('/memory/recipes')
+    async def recipe_lookup(request: Request, q: str = Query('',max_length=2000), limit: int = Query(100,ge=1,le=200)):
+        from .recipes import lookup
+        return await lookup(service(request).repository,q,limit)
+
+    @app.post('/memory/recipes')
+    async def recipe_ingest(body: IngestRequest, request: Request):
+        from .recipes import ingest
+        return await ingest(service(request).repository,body)
+
     @app.post("/memory/query", status_code=202)
     async def query(body: QueryRequest, request: Request):
         try:
