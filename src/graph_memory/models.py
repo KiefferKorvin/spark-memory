@@ -182,7 +182,7 @@ class Understanding(Strict):
     summary: str = Field(max_length=2000)
     routing_summary: str = Field(max_length=2000)
     temporal_scope: str | None = None
-    concepts: list[ConceptSpec] = Field(default_factory=list, max_length=20)
+    concepts: list[ConceptSpec] = Field(default_factory=list, max_length=5)
 
 
 class Resolution(Strict):

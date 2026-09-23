@@ -222,3 +222,18 @@ async def test_semantic_taxonomy_candidates_beat_lexical_noise(tmp_path):
     # Lexical side: a plural still finds its singular label ("Foodstuffs" -> "Food"), and generic words are cut.
     from graph_memory.graph import taxonomy_terms
     assert 'food' in taxonomy_terms('foods', {}, 10) and taxonomy_terms('technique crispy', {'technique': 40}, 4500) == ['crispy', 'crispys']
+
+
+async def test_failed_broader_concept_does_not_take_its_child_down(taxonomy):
+    class Model:
+        async def structured(self, operation, payload, schema, query_id=None):
+            candidate = payload['candidate']
+            if candidate['label'] == 'Bad parent' or candidate['broader']:
+                return TaxonomyResolution(reuse_id=None, parent_ids=[], confidence=.1)
+            music = next(e['id'] for e in payload['existing'] if e['label'] == 'Musique')
+            return TaxonomyResolution(reuse_id=None, parent_ids=[music], confidence=.9)
+    repo = await loaded(taxonomy)
+    linked, _, skipped = await OntologyService(repo, Model()).link(
+        [ConceptSpec(label='Music theory', broader=['Bad parent']), ConceptSpec(label='Bad parent')], {})
+    assert [k['label'] for k in skipped] == ['Bad parent']
+    assert {n.label for n in linked['music theory']} == {'Music theory', 'Musique'}

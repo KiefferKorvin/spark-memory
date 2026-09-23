@@ -108,7 +108,7 @@ class OntologyService:
         # Semantic candidates only once the thesaurus is embedded with this model (unesco --embed).
         embedded = await self.repository.read_record("taxonomy_embedding", self.authority)
         self.semantic = bool(embedded) and embedded["model"] == self.embedding_model
-        resolved, edges, skipped = {}, [], []
+        resolved, edges, skipped, failed = {}, [], [], set()
         remaining, gate = list(specs), asyncio.Semaphore(CONCURRENCY)
 
         async def classify(spec):
@@ -119,9 +119,13 @@ class OntologyService:
             # Parents extracted from the same text are classified first; a cyclic remainder runs as one layer.
             layer = [s for s in remaining if not any(p.casefold() == o.label.casefold() for p in s.broader for o in remaining if o is not s)] or remaining
             remaining = [s for s in remaining if not any(s is l for l in layer)]
+            # A same-document broader concept that failed cannot be a parent: classify its children without it.
+            layer = [s.model_copy(update={"broader": [b for b in s.broader if b.casefold() not in failed]})
+                     if failed & {b.casefold() for b in s.broader} else s for s in layer]
             for spec, result in zip(layer, await asyncio.gather(*map(classify, layer), return_exceptions=True)):
                 if isinstance(result, (ValueError, ProviderError)):
                     skipped.append(skip_record(spec, result))
+                    failed.add(spec.label.casefold())
                     continue
                 if isinstance(result, BaseException):
                     raise result
