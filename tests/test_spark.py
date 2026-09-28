@@ -111,3 +111,7 @@ def test_corrupted_extractions_are_dropped():
     assert corrupted("[s3] L'utilisateur étudie les marques diacritiques grecques chez 古希腊语", session)
     assert not corrupted("L'apprenant confond binaire et ternaire dans le shuffle (croches inégales).", session)
     assert not corrupted("学生觉得这个很难", "学生说：这个很难")  # a script the session itself uses is fine
+    french = "L'apprenant a trouvé la leçon de batterie difficile et le coach a conseillé de ralentir le tempo de la grosse caisse."
+    assert corrupted("Le pied droit (grosse caisse)... ", french)                       # cut off
+    assert corrupted("When asked how the lesson went, the learner answered that it was fine.", french)
+    assert not corrupted("L'apprenant a trouvé la leçon difficile.", french)

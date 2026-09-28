@@ -95,7 +95,11 @@ confidence and the entities they mention, each with general categories. On a Fre
 that the left hand tenses at 90 BPM, that ghost notes were unknown and failed, that the learner wants rock rather than
 jazz and finds 25 minutes too long, and the coach's advice as `assistant_said`. A session is one `spark` record with
 float32 vectors truncated to 1,024 dimensions (the embedding model is Matryoshka-trained); storing the same session ID
-replaces it, and erasing the scope erases them.
+replaces it, and erasing the scope erases them. Memories state only what was said, done or measured: an inference is
+a memory of its own, `hypothetical`, and only when the learner or the coach made it. A memory with code or markup debris,
+a cut-off sentence, a script the session never uses or English written about a French session is dropped: on real
+lessons about 4% of extractions degenerated that way, whatever the provider, before the prompt asked for complete
+sentences and no interpretation (0 of 225 after, reasoning effort minimal or low alike).
 
 Recall (`POST /memory/spark/recall`) makes no model call: entities named in the text (1-6-word phrases, accents
 ignored), the entities and memories closest to its embedding (asked of two providers at once, the first answer wins,
