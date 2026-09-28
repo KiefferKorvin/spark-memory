@@ -1,0 +1,38 @@
+# Clinical SPARK: a deployment apart from PAKT's memory (compose.yaml), with its own project, database volume,
+# token, model hosts and ports. See docs/CLINICAL.md. Variables come from .env.clinical only:
+#   docker compose --env-file .env.clinical -f compose.clinical.yaml up -d --build
+name: memory-clinical
+services:
+  neo4j:
+    image: neo4j:5.26-community
+    environment:
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in .env.clinical}"
+    ports:
+      - "127.0.0.1:7476:7474"
+      - "127.0.0.1:7690:7687"
+    volumes:
+      - clinical-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+  api:
+    build: .
+    env_file: .env.clinical
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      TERMINOLOGY_PATH: /terminologies/snomed.sqlite
+    volumes:
+      - type: bind
+        source: ${SNOMED_TERMINOLOGY:?Set SNOMED_TERMINOLOGY to the SQLite built by graph_memory.clinical build-terminology}
+        target: /terminologies/snomed.sqlite
+        read_only: true
+    command: ["uvicorn", "graph_memory.clinical_api:create_app", "--factory", "--host", "0.0.0.0", "--port", "8020", "--workers", "1"]
+    ports:
+      - "127.0.0.1:8020:8020"
+    depends_on:
+      neo4j:
+        condition: service_healthy
+volumes:
+  clinical-data:
