@@ -102,3 +102,12 @@ async def test_recall_for_a_subject_damps_the_others():
     rank = {(m["session"], m["text"]): i for i, m in enumerate(found["memories"])}
     hard = EXTRACTION["memories"][0]["text"]  # the same memory, stored under both subjects
     assert rank[("Rudiments simples", hard)] == 0 and rank[("Rudiments simples", hard)] < rank[("Rudiments au clavier", hard)]
+
+
+def test_corrupted_extractions_are_dropped():
+    from graph_memory.spark import corrupted
+    session = "Leçon « Binaire ↔ ternaire » : shuffle"
+    assert corrupted('Le [date] le suit - ~~A~ret">ass.: "setFiresVial(YoctoTestRunner.runAll())"*flag]]', session)
+    assert corrupted("[s3] L'utilisateur étudie les marques diacritiques grecques chez 古希腊语", session)
+    assert not corrupted("L'apprenant confond binaire et ternaire dans le shuffle (croches inégales).", session)
+    assert not corrupted("学生觉得这个很难", "学生说：这个很难")  # a script the session itself uses is fine

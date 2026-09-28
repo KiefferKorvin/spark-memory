@@ -18,12 +18,14 @@ class Settings(BaseSettings):
     # GLM 5.3 rejects disabling it (HTTP 400), so it runs at minimal effort (~10 tokens) and is not returned.
     openrouter_options: dict = {"provider": {"sort": "throughput", "require_parameters": True},
                                 "reasoning": {"effort": "minimal", "exclude": True}}
-    # Work nobody waits on (llm.BACKGROUND: ingestion, classification, SPARK extraction) takes the cheapest GLM endpoints
-    # instead: 3.3x cheaper and 2-4x slower in the 2026-09-28 bake-off on calls shaped like each operation (throughput
-    # routing lands on providers charging 3.3x GLM's list price). Sail Research charges 4x more for output: never used.
-    openrouter_background_options: dict = {"provider": {"order": ["InferenceNet", "DeepInfra"], "allow_fallbacks": True,
-                                                        "ignore": ["Sail Research"], "require_parameters": True},
-                                           "reasoning": {"effort": "minimal", "exclude": True}}
+    # Per-operation overrides of openrouter_options. Input-heavy work nobody waits on (concept classification, concept
+    # resolution, bibliographic metadata: ~3,500 tokens in, ~100 out) goes first to Sail Research's FP8 endpoint, billed at
+    # GLM's list price on input ($0.045/M against $0.15/M on the throughput-routed FP8 providers): 2.6x cheaper on these
+    # calls and 2x slower (2026-09-28 bake-off). Its output costs more, so output-heavy calls stay put. The endpoints 3.3x
+    # cheaper overall (InferenceNet, DeepInfra, OpenInference) serve FP4 and corrupted about 3% of SPARK extractions.
+    openrouter_operation_options: dict = {op: {"provider": {"order": ["Sail Research"], "sort": "throughput", "allow_fallbacks": True,
+                                                            "require_parameters": True}}
+                                          for op in ("taxonomy_resolution", "resolution", "source_metadata")}
     primary_ontology: str = "UNESCO"
     public_web_enabled: bool = True
     embedding_model: str = ""

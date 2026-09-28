@@ -29,10 +29,6 @@ class ModelProvider(Protocol):
 ANSWERS = {"synthesis", "dossier"}
 
 
-# Operations nobody waits on: they take the cheap routing (Settings.openrouter_background_options).
-BACKGROUND = {"understanding", "source_metadata", "resolution", "taxonomy_resolution", "enrichment", "spark_extract", "user_facts"}
-
-
 class ProviderError(RuntimeError):
     pass
 
@@ -111,7 +107,7 @@ class OpenRouter:
             await asyncio.sleep(wait if wait is not None else min(0.5 * 2**attempt, 4))
 
     async def structured(self, operation, payload, schema, query_id=None):
-        options = self.settings.openrouter_background_options if operation in BACKGROUND else self.settings.openrouter_options
+        options = {**self.settings.openrouter_options, **self.settings.openrouter_operation_options.get(operation, {})}
         model = self.settings.synthesis_model if operation in ANSWERS else self.settings.semantic_model
         # A synthesis length cap is an instruction for the system prompt, not data in the user message.
         limit = payload.get("answer_max_words", 0) if operation in ANSWERS else 0
