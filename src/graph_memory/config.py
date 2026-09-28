@@ -22,7 +22,8 @@ class Settings(BaseSettings):
     # resolution, bibliographic metadata: ~3,500 tokens in, ~100 out) goes first to Sail Research's FP8 endpoint, billed at
     # GLM's list price on input ($0.045/M against $0.15/M on the throughput-routed FP8 providers): 2.6x cheaper on these
     # calls and 2x slower (2026-09-28 bake-off). Its output costs more, so output-heavy calls stay put. The endpoints 3.3x
-    # cheaper overall (InferenceNet, DeepInfra, OpenInference) serve FP4 and corrupted about 3% of SPARK extractions.
+    # cheaper overall (InferenceNet, DeepInfra, OpenInference) serve FP4; they were not proven worse (SPARK extractions
+    # degenerated about 4% of the time on the FP8 route too), but DeepInfra throttles this account and FP8 costs nothing more here.
     openrouter_operation_options: dict = {op: {"provider": {"order": ["Sail Research"], "sort": "throughput", "allow_fallbacks": True,
                                                             "require_parameters": True}}
                                           for op in ("taxonomy_resolution", "resolution", "source_metadata")}

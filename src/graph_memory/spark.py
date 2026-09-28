@@ -34,7 +34,7 @@ CACHE = 64
 # more hops let the best-connected memories collect activation from every path and outrank the directly relevant ones.
 PARAMS = Params(hops=1)
 ENCOUNTER = r"^[A-Za-z0-9._:-]{1,120}$"
-# Degenerate model output, seen from an FP4 endpoint ("setFiresVial(YoctoTestRunner.runAll())*flag]]", "[s3]", Chinese in a
+# Degenerate model output, about 4% of extractions whatever the endpoint ("setFiresVial(YoctoTestRunner.runAll())*flag]]", "[s3]", Chinese in a
 # French session): code or markup debris, or a script the session never uses. Such a memory is dropped, never stored.
 DEBRIS = re.compile(r"\(\)|\]\]|~~|\[s\d+\]|\[date\]|\">|[a-z][A-Z][a-z]+\(")
 CJK = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
