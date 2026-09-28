@@ -9,6 +9,7 @@ from urllib.parse import unquote, urlencode, urlsplit
 from xml.etree import ElementTree
 
 from pydantic import Field
+import pakt_web
 
 from .models import IngestRequest, Strict
 from .parsing import extract
@@ -82,15 +83,24 @@ class PubMedRetriever:
 
 
 class WebRetriever:
-    """Keyless DuckDuckGo HTML search; result pages are fetched with public-address (SSRF) protection."""
+    """Obscura web research with keyless DuckDuckGo search and pinned HTTPS fallback."""
     RESULT = re.compile(r'class="result__a" href="[^"]*?uddg=([^&"]+)[^"]*"[^>]*>(.*?)</a>', re.S)
 
-    def __init__(self, max_bytes):
+    def __init__(self, max_bytes, web_browser='obscura', obscura_command=''):
         self.max_bytes = max_bytes
+        self.obscura = pakt_web.command(obscura_command) if web_browser == 'obscura' else None
         self.search_fetcher = SafeFetcher(["html.duckduckgo.com"], max_bytes)
         self.fetcher = SafeFetcher([], max_bytes, public_web=True)
 
     async def search(self, query, limit):
+        if self.obscura:
+            try:
+                hits = await asyncio.to_thread(pakt_web.search, query, self.max_bytes,
+                                               self.search_fetcher.validate, self.obscura, limit)
+                if hits:
+                    return [s for s in await asyncio.gather(*(self.page(h['url'], h['title']) for h in hits)) if s]
+            except ValueError:
+                logger.info('Obscura search unavailable; trying direct web search')
         data, _, _ = await self.search_fetcher.fetch("https://html.duckduckgo.com/html/?" + urlencode({"q": query}))
         results = {}
         for url, title in self.RESULT.findall(data.decode("utf-8", "replace")):
@@ -102,7 +112,15 @@ class WebRetriever:
 
     async def page(self, url, title):
         try:
-            data, mime, final = await self.fetcher.fetch(url)
+            data = None
+            if self.obscura and not urlsplit(url).path.lower().endswith('.pdf'):
+                try:
+                    data, mime, final = await asyncio.to_thread(pakt_web.fetch, url, self.max_bytes,
+                                                               self.fetcher.validate, executable=self.obscura)
+                except ValueError:
+                    logger.info('Obscura page unavailable; trying direct web reader')
+            if data is None:
+                data, mime, final = await self.fetcher.fetch(url)
             text = await asyncio.to_thread(extract, data, mime, self.max_bytes)
         except (ValueError, OSError) as exc:
             logger.info("Web result %s skipped: %s", url, exc)
@@ -132,11 +150,12 @@ class CompositeRetriever:
 RETRIEVERS = {"wikipedia": WikipediaRetriever, "pubmed": PubMedRetriever, "web": WebRetriever}
 
 
-def build_retriever(names, max_bytes):
+def build_retriever(names, max_bytes, web_browser='obscura', obscura_command=''):
     names = list(dict.fromkeys(n.strip().lower() for n in names.split(",") if n.strip()))
     if unknown := set(names) - RETRIEVERS.keys():
         raise ValueError(f"Unknown EXTERNAL_RETRIEVERS: {', '.join(sorted(unknown))}")
-    return CompositeRetriever([RETRIEVERS[n](max_bytes) for n in names]) if names else None
+    return CompositeRetriever([WebRetriever(max_bytes, web_browser, obscura_command) if n == 'web'
+                               else RETRIEVERS[n](max_bytes) for n in names]) if names else None
 
 
 def source_request(source):

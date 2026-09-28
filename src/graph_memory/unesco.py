@@ -132,7 +132,9 @@ def parse_skos(path, authority, language="fr", scheme_uri=None, base_uri=None):
         edge.metadata["skos_triples"].sort()
     from .graph import validate_edges
     validate_edges({n.id: n for n in nodes}, links)
-    canonical = json.dumps({"nodes": [n.model_dump() for n in nodes], "edges": [e.model_dump() for e in links]},
+    # The fingerprint identifies the thesaurus content, not memory's storage fields (scope is always shared here):
+    # hashing those made every stored snapshot "differ" when Node gained a field, and refused startup.
+    canonical = json.dumps({"nodes": [n.model_dump(exclude={"scope"}) for n in nodes], "edges": [e.model_dump() for e in links]},
                            sort_keys=True, ensure_ascii=False)
     scheme_properties = {str(p): sorted(str(o) for o in graph.objects(URIRef(scheme_uri), p))
                          for p in set(graph.predicates(URIRef(scheme_uri)))}

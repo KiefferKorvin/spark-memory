@@ -46,6 +46,12 @@ def interleave(rankings, limit):
 
 # Imported taxonomy entries without attached content are dead ends for evidence retrieval.
 CONTENT_FILTER = "(coalesce(n.origin,'LOCAL')='LOCAL' OR EXISTS { (n)<-[:ABOUT]-() })"
+# What a query may retrieve: its scopes, nothing forgotten. Nodes stored before scopes existed are shared.
+VISIBLE = CONTENT_FILTER + " AND coalesce(n.scope,'shared') IN $scopes AND NOT coalesce(n.excluded,false)"
+
+
+def visible(node, scopes):
+    return node.scope in scopes and not node.metadata.get("excluded")
 
 
 def cosine(a, b):
@@ -69,10 +75,15 @@ def rank(node, query, vector, hits=0, similarity=None):
 class GraphRepository(Protocol):
     async def initialize(self): ...
     async def close(self): ...
+    async def recipe_sources(self): ...
     async def get(self, node_id: str) -> Node | None: ...
     async def put(self, nodes: list[Node], edges: list[Edge]): ...
-    async def candidates(self, query: str, vector: list[float], limit: int,
-                         parent: str | None = None, kind: str | None = None) -> list[tuple[Node, float]]: ...
+    async def candidates(self, query: str, vector: list[float], limit: int, parent: str | None = None,
+                         kind: str | None = None, scopes=("shared",)) -> list[tuple[Node, float]]: ...
+    async def document_nodes(self, document_id: str) -> list[Node]: ...
+    async def documents_from(self, url: str) -> list[str]: ...
+    async def delete_document(self, document_id: str): ...
+    async def delete_scope(self, scope: str): ...
     async def neighbors(self, node_id: str, limit: int = 100) -> tuple[list[Node], list[Edge]]: ...
     async def exact_concept(self, label: str, authority: str | None = None) -> Node | None: ...
     async def import_taxonomy(self, nodes, edges, manifest): ...
@@ -83,12 +94,13 @@ class GraphRepository(Protocol):
     async def taxonomy_ancestors(self, node_id: str, authority: str = "UNESCO"): ...
     async def unesco_ancestors(self, node_id: str): ...
     async def provenance(self, node_id: str) -> dict: ...
-    async def record(self, category: str, key: str, data: dict): ...
+    async def record(self, category: str, key: str, data: dict, vector: list[float] | None = None): ...
+    async def similar_records(self, category: str, vector: list[float], limit: int = 5) -> list[tuple[dict, float]]: ...
     async def read_record(self, category: str, key: str) -> dict | None: ...
     async def records(self, category: str, prefix: str = "", after: str | None = None) -> list[dict]: ...
     async def delete_records(self, category: str, prefix: str = ""): ...
     async def stale_embeddings(self, dimensions: int, limit: int) -> list[Node]: ...
-    async def update_embeddings(self, nodes: list[Node]): ...
+    async def update_nodes(self, nodes: list[Node]): ...
     async def hit(self, node_id: str, success: bool = False) -> int: ...
 
 
@@ -152,7 +164,9 @@ def protect_taxonomy(nodes, edges):
 # Cosine in [-1, 1] computed in the database, so payloads need not carry vectors back to Python.
 SIMILARITY = ("CASE WHEN size($vector)>0 AND size(coalesce(n.embedding,[]))=size($vector) "
               "THEN 2*vector.similarity.cosine(n.embedding,$vector)-1 ELSE 0.0 END")
-VECTOR_INDEXES = {"memory_vector": "MemoryNode) ON (n.embedding", "ontology_vector": "ImportedConcept) ON (n.ontology_embedding"}
+# Records (episodes, searches) have their own index: their vectors never enter content retrieval.
+VECTOR_INDEXES = {"memory_vector": "MemoryNode) ON (n.embedding", "ontology_vector": "ImportedConcept) ON (n.ontology_embedding",
+                  "record_vector": "MemoryRecord) ON (n.vector"}
 
 
 def node_properties(node):
@@ -160,7 +174,8 @@ def node_properties(node):
     return {"payload": node.model_dump_json(exclude={"embedding"}), "kind": node.kind, "label": node.label,
             "label_key": node.label.casefold(), "text": node.text, "routing_summary": node.routing_summary,
             "embedding": node.embedding, "aliases": [a.casefold() for a in getattr(node, "aliases", [])],
-            "origin": getattr(node, "origin", None), "uri": getattr(node, "uri", None)}
+            "origin": getattr(node, "origin", None), "uri": getattr(node, "uri", None),
+            "scope": node.scope, "excluded": bool(node.metadata.get("excluded"))}
 
 
 class InMemoryGraph:
@@ -171,6 +186,7 @@ class InMemoryGraph:
         self.stats = defaultdict(lambda: {"navigation_hits": 0, "successful_retrievals": 0})
         # Taxonomy embeddings live apart from node embeddings, like Neo4j's separate ontology_vector index.
         self.ontology_vectors = {}
+        self.record_vectors = {}
         self.lock = asyncio.Lock()
 
     async def initialize(self):
@@ -178,6 +194,9 @@ class InMemoryGraph:
 
     async def close(self):
         pass
+
+    async def recipe_sources(self):
+        return [n for n in self.nodes.values() if n.kind=='Source' and n.metadata.get('pakt_recipe')]
 
     async def get(self, node_id):
         node = self.nodes.get(node_id)
@@ -254,8 +273,8 @@ class InMemoryGraph:
         ids = {i for e in edges for i in (e.source, e.target)} - {node_id}
         return [await self.get(i) for i in sorted(ids)], edges
 
-    async def candidates(self, query, vector, limit, parent=None, kind=None):
-        nodes = list(self.nodes.values())
+    async def candidates(self, query, vector, limit, parent=None, kind=None, scopes=("shared",)):
+        nodes = [n for n in self.nodes.values() if visible(n, scopes)]
         if parent:
             # Fetch the entire test neighborhood before ranking, unlike a first-N slice.
             ids = {e.target if e.source == parent else e.source
@@ -270,6 +289,36 @@ class InMemoryGraph:
 
     async def unesco_ancestors(self, node_id):
         return await self.taxonomy_ancestors(node_id, "UNESCO")
+
+    def subtree(self, document_id):
+        ids = {document_id} if document_id in self.nodes else set()
+        while grown := {e.target for e in self.edges.values() if e.source in ids and e.relation == Relation.CONTAINS} - ids:
+            ids |= grown
+        return ids
+
+    async def document_nodes(self, document_id):
+        return [await self.get(i) for i in sorted(self.subtree(document_id))]
+
+    async def documents_from(self, url):
+        sources = {i for i, n in self.nodes.items() if n.kind == "Source" and n.uri == url}
+        return sorted({e.target for e in self.edges.values() if e.source in sources and e.relation == Relation.PROVIDES})
+
+    async def delete_document(self, document_id):
+        async with self.lock:
+            gone = self.subtree(document_id)
+            gone |= {e.source for e in self.edges.values() if e.relation == Relation.SUPPORTED_BY and e.target in gone}
+            providers = {e.source for e in self.edges.values() if e.relation == Relation.PROVIDES and e.target == document_id}
+            gone |= {s for s in providers if all(e.target == document_id for e in self.edges.values()
+                                                 if e.source == s and e.relation == Relation.PROVIDES)}
+            self.drop(gone)
+
+    async def delete_scope(self, scope):
+        async with self.lock:
+            self.drop({i for i, n in self.nodes.items() if n.scope == scope})
+
+    def drop(self, ids):
+        self.nodes = {i: n for i, n in self.nodes.items() if i not in ids}
+        self.edges = {k: e for k, e in self.edges.items() if e.source not in ids and e.target not in ids}
 
     async def provenance(self, node_id):
         reachable = {node_id}
@@ -289,8 +338,14 @@ class InMemoryGraph:
                 "contradictions": [e.target if e.source == node_id else e.source for e in self.edges.values()
                                    if e.relation == Relation.CONTRADICTS and node_id in (e.source, e.target)]}
 
-    async def record(self, category, key, data):
+    async def record(self, category, key, data, vector=None):
         self.data[(category, key)] = json.loads(json.dumps(data))
+        if vector:
+            self.record_vectors[(category, key)] = vector
+
+    async def similar_records(self, category, vector, limit=5):
+        scored = [(json.loads(json.dumps(self.data[k])), cosine(v, vector)) for k, v in self.record_vectors.items() if k[0] == category]
+        return sorted(scored, key=lambda pair: -pair[1])[:limit]
 
     async def read_record(self, category, key):
         data = self.data.get((category, key))
@@ -303,14 +358,15 @@ class InMemoryGraph:
     async def delete_records(self, category, prefix=""):
         for key in [k for k in self.data if k[0] == category and k[1].startswith(prefix)]:
             del self.data[key]
+            self.record_vectors.pop(key, None)
 
     async def stale_embeddings(self, dimensions, limit):
         return [n.model_copy(deep=True) for n in self.nodes.values() if n.embedding and len(n.embedding) != dimensions][:limit]
 
-    async def update_embeddings(self, nodes):
+    async def update_nodes(self, nodes):
         async with self.lock:
             for node in nodes:
-                self.nodes[node.id] = self.nodes[node.id].model_copy(update={"embedding": node.embedding})
+                self.nodes[node.id] = node.model_copy(deep=True)
 
     async def hit(self, node_id, success=False):
         self.stats[node_id]["successful_retrievals" if success else "navigation_hits"] += 1
@@ -368,6 +424,10 @@ class Neo4jGraph:
 
     async def close(self):
         await self.driver.close()
+
+    async def recipe_sources(self):
+        rows=await self.run("MATCH (n:Source) WHERE n.payload CONTAINS 'pakt_recipe' RETURN n.payload AS payload")
+        return [node_from(json.loads(row['payload'])) for row in rows]
 
     async def get(self, node_id):
         rows = await self.run("MATCH (n:MemoryNode {id:$id}) RETURN n.payload AS payload", id=node_id)
@@ -495,26 +555,28 @@ class Neo4jGraph:
         return list({r["payload"]: node_from(json.loads(r["payload"])) for r in rows}.values()), [
             Edge(source=r["source"], target=r["target"], relation=r["relation"], metadata=json.loads(r["metadata"] or "{}")) for r in rows]
 
-    async def candidates(self, query, vector, limit, parent=None, kind=None):
+    async def candidates(self, query, vector, limit, parent=None, kind=None, scopes=("shared",)):
         lexical = " OR ".join(sorted(terms(query))[:80]) or "__no_terms__"
+        scopes = list(scopes)
+        # ponytail: scope and exclusion filter the vector index's top hits; with many private documents, filter the index.
         # Independent indexes seed candidates; parent filtering also ranks its whole neighborhood in the DB.
         # The content filter runs before LIMIT so thousands of empty taxonomy labels cannot crowd out content.
         rows = await self.run("CALL db.index.fulltext.queryNodes('memory_text',$query) YIELD node AS n,score "
-                              f"WHERE {CONTENT_FILTER} RETURN n.payload AS payload,{SIMILARITY} AS similarity ORDER BY score DESC LIMIT $pool",
-                              query=lexical, pool=limit*4, vector=vector)
+                              f"WHERE {VISIBLE} RETURN n.payload AS payload,{SIMILARITY} AS similarity ORDER BY score DESC LIMIT $pool",
+                              query=lexical, pool=limit*4, vector=vector, scopes=scopes)
         if vector:
             rows += await self.run("CALL db.index.vector.queryNodes('memory_vector',$pool,$vector) YIELD node AS n,score "
-                                   f"WHERE {CONTENT_FILTER} RETURN n.payload AS payload,{SIMILARITY} AS similarity", pool=limit*4, vector=vector)
+                                   f"WHERE {VISIBLE} RETURN n.payload AS payload,{SIMILARITY} AS similarity", pool=limit*4, vector=vector, scopes=scopes)
         ids = None
         if parent:
             neighbors = await self.run(
                 "MATCH (:MemoryNode {id:$parent})--(n:MemoryNode) "
-                f"WHERE n.kind <> 'Source' AND n.kind <> 'ExternalConcept' AND ($kind IS NULL OR n.kind=$kind) AND {CONTENT_FILTER} "
+                f"WHERE n.kind <> 'Source' AND n.kind <> 'ExternalConcept' AND ($kind IS NULL OR n.kind=$kind) AND {VISIBLE} "
                 "WITH DISTINCT n, size([t IN $terms WHERE toLower(n.label+' '+n.routing_summary+' '+n.text) CONTAINS t]) "
                 "+ CASE WHEN size(n.embedding)=size($vector) AND size($vector)>0 THEN vector.similarity.cosine(n.embedding,$vector) ELSE 0 END "
                 "+ 0.01*coalesce(n.successful_retrievals,0) AS score "
                 f"RETURN n.payload AS payload,score,{SIMILARITY} AS similarity ORDER BY score DESC LIMIT $pool",
-                parent=parent, kind=kind, terms=list(terms(query)), vector=vector, pool=limit*4)
+                parent=parent, kind=kind, terms=list(terms(query)), vector=vector, pool=limit*4, scopes=scopes)
             rows += neighbors
             # Restrict index hits to actual neighbors, without sending a huge child list to Python/Jev.
             candidates = [json.loads(r["payload"])["id"] for r in rows]
@@ -533,6 +595,27 @@ class Neo4jGraph:
     async def unesco_ancestors(self, node_id):
         return await self.taxonomy_ancestors(node_id, "UNESCO")
 
+    async def document_nodes(self, document_id):
+        rows = await self.run("MATCH (:Document {id:$id})-[:CONTAINS*0..]->(n) RETURN DISTINCT n.payload AS payload", id=document_id)
+        return [node_from(json.loads(r["payload"])) for r in rows]
+
+    async def documents_from(self, url):
+        rows = await self.run("MATCH (:Source {uri:$url})-[:PROVIDES]->(d:Document) RETURN DISTINCT d.id AS id", url=url)
+        return sorted(r["id"] for r in rows)
+
+    async def delete_document(self, document_id):
+        """Erases a document, its sections and chunks, assertions extracted from them and sources providing only it.
+        Concepts stay: they are shared knowledge, and ABOUT links go with the nodes."""
+        await self.run("MATCH (s:Source)-[:PROVIDES]->(:Document {id:$id}) "
+                       "WHERE NOT EXISTS { MATCH (s)-[:PROVIDES]->(o:Document) WHERE o.id <> $id } DETACH DELETE s", id=document_id)
+        await self.run("MATCH (:Document {id:$id})-[:CONTAINS*0..]->(n) OPTIONAL MATCH (a:Assertion)-[:SUPPORTED_BY]->(n) "
+                       "WITH collect(DISTINCT n) + collect(DISTINCT a) AS gone UNWIND gone AS g DETACH DELETE g", id=document_id)
+
+    async def delete_scope(self, scope):
+        while (await self.run("MATCH (n:MemoryNode {scope:$scope}) WITH n LIMIT 5000 DETACH DELETE n RETURN count(*) AS deleted",
+                              scope=scope))[0]["deleted"]:
+            pass
+
     async def provenance(self, node_id):
         rows = await self.run(
             "MATCH (n:MemoryNode {id:$id}) OPTIONAL MATCH (n)-[:SUPPORTED_BY]->(support) "
@@ -544,9 +627,21 @@ class Neo4jGraph:
         return {"sources": [json.loads(s) for s in rows[0]["sources"]], "documents": rows[0]["documents"],
                 "section_path": getattr(node, "section_path", []), "contradictions": [r["id"] for r in contradictions]}
 
-    async def record(self, category, key, data):
-        await self.run("MERGE (r:MemoryRecord {category:$category,key:$key}) SET r.payload=$payload",
-                       category=category, key=key, payload=json.dumps(data))
+    async def record(self, category, key, data, vector=None):
+        # A record keeps its vector when rewritten without one (e.g. a counter update).
+        await self.run("MERGE (r:MemoryRecord {category:$category,key:$key}) SET r.payload=$payload, r.vector=coalesce($vector, r.vector)",
+                       category=category, key=key, payload=json.dumps(data), vector=vector or None)
+
+    async def similar_records(self, category, vector, limit=5):
+        """Records of a category nearest to a vector, as (data, cosine). Through the record_vector index: a scan took
+        47 ms for 150 episodes and grows with every distinct question. The index is shared by all categories, so it is
+        asked for ten times more hits than needed before filtering by category."""
+        if len(vector) != self.settings.embedding_dimensions:
+            return []
+        rows = await self.run("CALL db.index.vector.queryNodes('record_vector', $k, $vector) YIELD node AS r, score "
+                              "WHERE r.category = $category RETURN r.payload AS payload, 2*score-1 AS score ORDER BY score DESC LIMIT $limit",
+                              category=category, vector=vector, k=limit * 10, limit=limit)
+        return [(json.loads(r["payload"]), r["score"]) for r in rows]
 
     async def read_record(self, category, key):
         rows = await self.run("MATCH (r:MemoryRecord {category:$category,key:$key}) RETURN r.payload AS payload", category=category, key=key)
@@ -568,9 +663,10 @@ class Neo4jGraph:
                               "RETURN n.payload AS payload LIMIT $limit", dimensions=dimensions, limit=limit)
         return [node_from(json.loads(r["payload"])) for r in rows]
 
-    async def update_embeddings(self, nodes):
-        await self.run("UNWIND $rows AS row MATCH (n:MemoryNode {id:row.id}) SET n.embedding=row.embedding, n.payload=row.payload",
-                       rows=[{"id": n.id, "embedding": n.embedding, "payload": node_properties(n)["payload"]} for n in nodes])
+    async def update_nodes(self, nodes):
+        """Rewrites existing nodes (a new embedding, a light document's summaries); put() only creates them."""
+        await self.run("UNWIND $rows AS row MATCH (n:MemoryNode {id:row.id}) SET n += row.props",
+                       rows=[{"id": n.id, "props": node_properties(n)} for n in nodes])
 
     async def hit(self, node_id, success=False):
         field = "successful_retrievals" if success else "navigation_hits"

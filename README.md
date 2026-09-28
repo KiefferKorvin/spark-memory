@@ -4,6 +4,8 @@ Reusable Python/FastAPI memory infrastructure with a Neo4j property graph, OpenR
 
 The three graph layers are documents, concepts and sourced assertions. Retrieval combines indexes, graph neighborhoods, bounded concurrent traversal, evidence coverage and optional external retrieval. Sources and contradictory assertions remain attributable.
 
+The `web` retriever uses Obscura for DuckDuckGo search and JavaScript page reading, with direct HTTPS as a fallback. Wikipedia and PubMed retain their APIs. Docker installs checksum-pinned Obscura v0.2.3 (no-render/stealth: JavaScript works, screenshots are omitted). For a local Windows checkout, run `python scripts/install_obscura.py ../.tools/obscura` from `memory/`; that path is detected automatically. Else install to your PATH or set `PAKT_OBSCURA_COMMAND` to the executable's absolute path in `memory/.env`. Restart the API after installation. `PAKT_WEB_BROWSER=direct` disables the browser. Each page uses isolated cookies, a 25-second navigation budget, bounded output, public-network checks and robots.txt enforcement; blocked/unreadable pages may still fail. The adapter is the stdlib-only `src/pakt_web.py`, also imported by the parent PAKT application.
+
 UNESCO Thesaurus 2026 is the primary live taxonomy. Import the local RDF/TTL before
 ingesting documents, or configure `UNESCO_THESAURUS_PATH` for startup import.
 See [UNESCO setup, schema and indexing](docs/UNESCO.md) and the
@@ -117,6 +119,7 @@ Local validation uses mocked OpenRouter transport and synthetic retrieval, not b
 
 - [Architecture](docs/ARCHITECTURE.md), [graph schema](docs/GRAPH_SCHEMA.md), [API](docs/API.md)
 - [Ingestion](docs/INGESTION.md), [retrieval](docs/RETRIEVAL.md), [navigation](docs/NAVIGATION.md)
+- [Memory roles](docs/MEMORY.md): semantic, episodic, user and procedural memory, scopes and forgetting
 - [Visualization](docs/VISUALIZATION.md), [security](docs/SECURITY.md), [decisions and limits](docs/DECISIONS.md)
 - Prompts and explicit cache-invalidation version: `src/graph_memory/prompts.py`
 - Synthetic documents and five example questions: `src/graph_memory/demo.py`

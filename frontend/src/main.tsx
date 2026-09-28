@@ -14,6 +14,7 @@ function App() {
   const [token, setToken] = useState('');
   const [query, setQuery] = useState('Why are rootless voicings useful and how should I practice them?');
   const [queryId, setQueryId] = useState('');
+  const [dossier, setDossier] = useState(false);
   const [events, setEvents] = useState<Trace[]>([]);
   const [cursor, setCursor] = useState<number | null>(null);
   const [playing, setPlaying] = useState(false);
@@ -127,7 +128,7 @@ function App() {
   async function run() {
     setBusy(true); setError(''); setEvents([]); setCursor(null); setPlaying(false); setResult(null); setSelected(null);
     setManual({ nodes: {}, edges: {} }); setHidden(new Set()); latestSequence.current = 0;
-    try { const data = await api('/query', token, { method: 'POST', body: JSON.stringify({ query, allow_external: true }) }); setQueryId(data.query_id); await follow(data.query_id); }
+    try { const data = await api('/query', token, { method: 'POST', body: JSON.stringify({ query, allow_external: true, mode: dossier ? 'dossier' : 'answer' }) }); setQueryId(data.query_id); await follow(data.query_id); }
     catch (e) { setError((e as Error).message); }
     finally { setBusy(false); }
   }
@@ -166,7 +167,7 @@ function App() {
     <main>
       <section className="workspace">
         <div className="intro"><div className="eyebrow">FOLLOW THE EVIDENCE</div><h1>Watch a question become knowledge.</h1><p>Explore connected sources, inspect decisions, and see where memory still has gaps.</p></div>
-        <form className="query" onSubmit={e => { e.preventDefault(); void run(); }}><label className="sr-only" htmlFor="question">Your question</label><textarea id="question" value={query} onChange={e => setQuery(e.target.value)} rows={2}/><button disabled={busy || !query.trim()}>{busy ? 'Exploring…' : 'Explore graph ↗'}</button></form>
+        <form className="query" onSubmit={e => { e.preventDefault(); void run(); }}><label className="sr-only" htmlFor="question">Your question</label><textarea id="question" value={query} onChange={e => setQuery(e.target.value)} rows={2}/><label className="toggle" htmlFor="dossier-mode" title="Report what the sources in memory say about this topic: main points, agreements, disagreements and dates"><input id="dossier-mode" type="checkbox" checked={dossier} onChange={e => setDossier(e.target.checked)}/>What do my sources say</label><button disabled={busy || !query.trim()}>{busy ? 'Exploring…' : 'Explore graph ↗'}</button></form>
         {error && <p role="alert" className="error">{error}</p>}
         {notice && <p role="status" className="muted">{notice}</p>}
         <div className="graph-shell">

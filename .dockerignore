@@ -5,3 +5,5 @@
 frontend
 tests
 docs
+.env.clinical
+benchmarks

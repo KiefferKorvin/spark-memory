@@ -19,7 +19,7 @@ async def reembed(repository, models, settings, batch=8):
     while nodes := await repository.stale_embeddings(settings.embedding_dimensions, batch):
         for node, vector in zip(nodes, await models.embed_batch([embedding_text(n) for n in nodes])):
             node.embedding = vector
-        await repository.update_embeddings(nodes)
+        await repository.update_nodes(nodes)
         count += len(nodes)
     return {"nodes": count, "taxonomy": await embed_taxonomy(repository, models, settings)}
 

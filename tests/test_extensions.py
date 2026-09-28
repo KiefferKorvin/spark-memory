@@ -149,7 +149,7 @@ async def test_online_retrievers_parse_and_interleave(monkeypatch):
         body = responses[key]
         return (json.dumps(body).encode() if isinstance(body, dict) else body), 'text/html', url
     monkeypatch.setattr(SafeFetcher, 'fetch', fetch)
-    results = await build_retriever('wikipedia, pubmed, web', 100000).search('boiling point altitude', 4)
+    results = await build_retriever('wikipedia, pubmed, web', 100000, web_browser='direct').search('boiling point altitude', 4)
     assert [r.metadata['retriever'] for r in results] == ['wikipedia', 'pubmed', 'web', 'wikipedia']
     assert results[0].title == 'Boiling point'  # search rank order, not page-id order
     assert results[1].title == 'Altitude and boiling' and 'RESULTS: Lower pressure' in results[1].text and 'Curie M' in results[1].text

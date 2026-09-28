@@ -300,3 +300,9 @@ async def test_skip_verdicts_are_cached_until_their_scope_changes(taxonomy):
     fresh = Counting(.2)
     await OntologyService(repo, fresh, threshold=.8, cache=False).link(spec, {})  # the replay decides afresh
     assert fresh.calls == 1
+
+
+def test_snapshot_fingerprint_is_stable(taxonomy):
+    # Stored graphs compare this fingerprint at every startup and refuse a different one. It once changed because a
+    # storage field was added to Node; a new value here means every existing graph would stop starting.
+    assert taxonomy.manifest['fingerprint'] == '273c43803ee52d80bb2e49023fe17993c2411d9c73f3395385fbb8bc0bc326f8'

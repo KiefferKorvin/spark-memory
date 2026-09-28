@@ -9,3 +9,6 @@ frontend/.test-build/
 frontend/*.tsbuildinfo
 *.egg-info/
 benchmarks/rag_qa_arena/runs/
+.env.clinical
+benchmarks/longmemeval/runs/
+benchmarks/longmemeval/cache/

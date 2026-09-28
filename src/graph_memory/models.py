@@ -18,6 +18,11 @@ class Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+# "shared" is the common memory; a private scope is "<kind>:<opaque id>" (e.g. "user:42"), chosen by the client, which
+# the module never resolves to accounts. Scopes isolate what one subject's queries read, not access to the API.
+SCOPE = r"^(shared|[a-z][a-z0-9_-]{0,30}:[A-Za-z0-9_.@-]{1,120})$"
+
+
 class Node(Strict):
     id: str = Field(default_factory=lambda: str(uuid4()))
     kind: str
@@ -27,6 +32,7 @@ class Node(Strict):
     routing_summary: str = ""
     embedding: list[float] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    scope: str = "shared"
 
 
 class Source(Node):
@@ -150,11 +156,69 @@ class IngestRequest(Strict):
     author: str | None = Field(None, max_length=300)
     published_at: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    scope: str = Field("shared", pattern=SCOPE)  # a private scope keeps its own copy, out of the shared concept graph
 
     @model_validator(mode="after")
     def one_content(self):
         if sum(x is not None for x in (self.text, self.content_base64, self.url)) != 1:
             raise ValueError("Provide exactly one of text, content_base64, url")
+        return self
+
+
+FactKind = Literal["preference", "constraint", "objective", "profile"]
+
+
+class Fact(Strict):
+    """Something about the user of a private scope: stated by the client, or inferred and then confirmed."""
+    kind: FactKind
+    text: str = Field(min_length=1, max_length=500)  # a short third-person statement, e.g. "Avoids red meat"
+
+
+class FactUpdate(Strict):
+    kind: FactKind | None = None
+    text: str | None = Field(None, min_length=1, max_length=500)
+    status: Literal["active", "proposed", "rejected"] | None = None  # confirm (active) or reject a proposal
+
+
+class ProposedFact(Fact):
+    evidence: list[int] = Field(default_factory=list, max_length=50)  # numbers of the questions that support it
+
+
+class FactProposals(Strict):
+    facts: list[ProposedFact] = Field(max_length=20)
+
+
+class BlockRequest(Strict):
+    reason: str = Field(min_length=1, max_length=300)
+
+
+class ForgetRequest(Strict):
+    reason: str = Field(min_length=1, max_length=300)  # e.g. outdated, wrong, low quality, user request
+    hard: bool = False  # erase (irreversible) instead of excluding from retrieval
+    url: str | None = Field(None, max_length=2048)  # forget every document from this URL; required on /memory/forget
+
+
+IMAGE_ID = r"^[0-9a-f]{64}$"
+
+
+class ImageRequest(Strict):
+    """An image to keep for reuse: fetched from `url`, or generated from `prompt` (by `model`)."""
+    data: str = Field(min_length=1)  # base64; the size limit applies to the decoded bytes
+    origin: Literal["fetched", "generated"]
+    url: str | None = Field(None, max_length=2048)
+    prompt: str | None = Field(None, min_length=1, max_length=8000)
+    model: str | None = Field(None, max_length=200)
+    title: str = Field("", max_length=300)
+    description: str = Field("", max_length=2000)
+    metadata: dict[str, Any] = Field(default_factory=dict)  # e.g. author, license, page_url
+    scope: str = Field("shared", pattern=SCOPE)
+
+    @model_validator(mode="after")
+    def provenance(self):
+        if self.origin == "fetched" and not (self.url or "").startswith(("http://", "https://")):
+            raise ValueError("A fetched image needs the http(s) url it came from")
+        if self.origin == "generated" and not self.prompt:
+            raise ValueError("A generated image needs its prompt")
         return self
 
 
@@ -285,6 +349,11 @@ class QueryRequest(Strict):
     query: str = Field(min_length=1, max_length=5000)
     allow_external: bool = True
     answer_max_words: int | None = Field(None, ge=1, le=2000)  # overrides ANSWER_MAX_WORDS for this query
+    synthesize: bool = True  # false: retrieval only, for clients that use the evidence and not the answer
+    # dossier: what the sources say about a topic (wider exploration, points with agreements and disagreements)
+    mode: Literal["answer", "dossier"] = "answer"
+    scope: str | None = Field(None, pattern=SCOPE)  # a private scope read beside the shared memory
+    reuse: bool = True  # false: answer afresh even if the same question was answered recently (see episodes)
     original_sources_only: bool = False
 
 

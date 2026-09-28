@@ -617,7 +617,7 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
               "oracle_rag": lambda q: [{"doc": g, "text": texts[g]} for g in q["gold"]]}
 
     async def kg_memory(q):
-        result = await memory.query(QueryRequest(query=q["question"], allow_external=False,
+        result = await memory.query(QueryRequest(query=q["question"], allow_external=False, reuse=False,
                                                  answer_max_words=word_limit(standard, q["reference"])))
         usage = [u for u in await memory.repository.records("usage") if u.get("query_id") == result["query_id"]]
         extra = {"query_id": result["query_id"], "status": result.get("status"), "calls": len(usage),
@@ -628,7 +628,7 @@ async def evaluate(args, run, memory, client, settings, questions, corpus):
         docs = [s.get("metadata", {}).get("bench_doc_id") for e in context for s in e["provenance"].get("sources", [])]
         return {**extra, "pred": without_citations(result["answer"], {e["id"] for e in context}),
                 "retrieved": [d for d in dict.fromkeys(docs) if d], "fallback": result["answer"].startswith("Synthesis unavailable"),
-                "needs": [n["description"] for n in result["information_needs"]], "coverage": result["coverage"]["overall_status"],
+                "needs": [n["description"] for n in result["information_needs"]], "coverage": (result["coverage"] or {}).get("overall_status"),
                 "nodes_explored": result["nodes_explored"], "evidence": len(result["evidence"]), "context": len(context),
                 "context_texts": context_texts(context)}
 

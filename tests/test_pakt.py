@@ -19,7 +19,7 @@ async def test_generated_artifact_does_not_satisfy_original_source_query():
         assert ordinary['evidence']
         original=await memory.query(QueryRequest(query='Lentils protein fiber',allow_external=False,original_sources_only=True))
         assert original['evidence']==[]
-        assert original['coverage']['overall_status']=='INSUFFICIENT'
+        assert original['context']==[] and original['evidence_ids']==[]
         await memory.ingest(IngestRequest(title='Lentils source',text='Lentils contain protein and fiber.',
                                           metadata={'original_uri':'https://example.org/lentils'}))
         sourced=await memory.query(QueryRequest(query='Lentils protein fiber',allow_external=False,original_sources_only=True))

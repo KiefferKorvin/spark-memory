@@ -1,16 +1,19 @@
 import asyncio
 import hmac
 import json
+import re
 from contextlib import asynccontextmanager
+from typing import Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.types import ASGIApp
 
 from .config import Settings
-from .llm import ProviderError
-from .models import IngestRequest, QueryRequest
+from .llm import AccountError, ProviderError
+from .models import IMAGE_ID, SCOPE, BlockRequest, Fact, FactUpdate, ForgetRequest, ImageRequest, IngestRequest, QueryRequest
 from .service import Memory
+from .spark import RecallRequest, SessionRequest
 
 
 class BodyLimit:
@@ -68,6 +71,10 @@ def create_app(memory=None):
     @app.exception_handler(ProviderError)
     async def provider_failed(request, exc):
         return JSONResponse({"detail": "Model provider unavailable or returned invalid data"}, status_code=502)
+
+    @app.exception_handler(AccountError)
+    async def provider_refused(request, exc):
+        return JSONResponse({"detail": "Model provider refused the API key or its credits"}, status_code=502)
 
     @app.get("/memory/health")
     async def health():
@@ -159,6 +166,100 @@ def create_app(memory=None):
             raise HTTPException(404, "Unknown concept")
         return result
 
+    @app.post("/memory/documents/{node_id}/forget")
+    async def forget_document(node_id: str, body: ForgetRequest, request: Request):
+        await document(node_id, request)
+        return await service(request).forget(body.reason, document_id=node_id, hard=body.hard)
+
+    @app.post("/memory/documents/{node_id}/restore")
+    async def restore_document(node_id: str, request: Request):
+        await document(node_id, request)
+        return await service(request).restore(node_id)
+
+    @app.post("/memory/forget")
+    async def forget_url(body: ForgetRequest, request: Request):
+        if not body.url:
+            raise HTTPException(422, "url is required")
+        return await service(request).forget(body.reason, url=body.url, hard=body.hard)
+
+    def private(scope):
+        if scope == "shared" or not re.fullmatch(SCOPE, scope):
+            raise HTTPException(422, "A private scope such as user:42 is required")
+        return scope
+
+    @app.get("/memory/episodes")
+    async def episodes(request: Request, scope: str = Query("shared", pattern=SCOPE), q: str = Query("", max_length=5000),
+                       limit: int = Query(20, ge=1, le=200)):
+        return await service(request).episodes(scope, q or None, limit)
+
+    @app.get("/memory/scopes/{scope}/facts")
+    async def facts(scope: str, request: Request):
+        return await service(request).facts(private(scope))
+
+    @app.post("/memory/scopes/{scope}/facts")
+    async def add_fact(scope: str, body: Fact, request: Request):
+        return await service(request).add_fact(private(scope), body.kind, body.text)
+
+    @app.post("/memory/scopes/{scope}/facts/infer")
+    async def infer_facts(scope: str, request: Request):
+        return await service(request).infer_facts(private(scope))
+
+    @app.patch("/memory/scopes/{scope}/facts/{fact_id}")
+    async def update_fact(scope: str, fact_id: str, body: FactUpdate, request: Request):
+        try:
+            return await service(request).update_fact(private(scope), fact_id, body.model_dump())
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.delete("/memory/scopes/{scope}/facts/{fact_id}")
+    async def delete_fact(scope: str, fact_id: str, request: Request):
+        try:
+            await service(request).delete_fact(private(scope), fact_id)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        return {"deleted": fact_id}
+
+    @app.post("/memory/spark/sessions")
+    async def spark_session(body: SessionRequest, request: Request):
+        """A finished session joins the scope's associative memory: one extraction call."""
+        private(body.scope)
+        return await service(request).spark.remember(body)
+
+    @app.post("/memory/spark/recall")
+    async def spark_recall(body: RecallRequest, request: Request):
+        """Memories the text activates in the scope, with no model call: for every message of a live conversation."""
+        private(body.scope)
+        return await service(request).spark.recall(body)
+
+    @app.delete("/memory/scopes/{scope}")
+    async def erase_scope(scope: str, request: Request):
+        return await service(request).erase_scope(private(scope))
+
+    @app.post("/memory/images")
+    async def store_image(body: ImageRequest, request: Request):
+        return await service(request).images.remember(body)
+
+    @app.get("/memory/images")
+    async def images(request: Request, scope: str = Query("shared", pattern=SCOPE), url: str = Query("", max_length=2048),
+                     q: str = Query("", max_length=8000), origin: Literal["fetched", "generated"] | None = None,
+                     limit: int = Query(20, ge=1, le=100)):
+        return {"images": await service(request).images.find(scope, url or None, q or None, origin, limit)}
+
+    @app.get("/memory/images/{image_id}")
+    async def image(request: Request, image_id: str = Path(pattern=IMAGE_ID), scope: str = Query("shared", pattern=SCOPE)):
+        try:
+            return await service(request).images.get(scope, image_id)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.delete("/memory/images/{image_id}")
+    async def forget_image(request: Request, image_id: str = Path(pattern=IMAGE_ID), scope: str = Query("shared", pattern=SCOPE)):
+        try:
+            await service(request).images.forget(scope, image_id)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        return {"deleted": image_id}
+
     @app.post("/memory/nodes/{node_id}/enrich")
     async def enrich(node_id: str, request: Request):
         return [n.model_dump(exclude={"embedding"}) for n in await service(request).enrichment.enrich(node_id, force=True)]
@@ -168,6 +269,20 @@ def create_app(memory=None):
         repository = service(request).repository
         return {"authority": settings.primary_ontology, "available": await repository.records("taxonomy"), "manifest": await repository.read_record("taxonomy", settings.primary_ontology),
                 "roots": [n.model_dump(exclude={"embedding"}) for n in await repository.taxonomy_roots(settings.primary_ontology)]}
+
+    @app.get("/memory/procedures")
+    async def procedures(request: Request):
+        return await service(request).retrieval.knowhow.listing()
+
+    @app.post("/memory/procedures/hosts/{name}/block")
+    async def block_host(name: str, body: BlockRequest, request: Request):
+        await service(request).retrieval.knowhow.block(name.removeprefix("www."), body.reason)
+        return await service(request).retrieval.knowhow.stats("host", name.removeprefix("www."))
+
+    @app.delete("/memory/procedures/hosts/{name}/block")
+    async def unblock_host(name: str, request: Request):
+        await service(request).retrieval.knowhow.block(name.removeprefix("www."))
+        return await service(request).retrieval.knowhow.stats("host", name.removeprefix("www."))
 
     @app.get("/memory/metrics")
     async def metrics(request: Request):

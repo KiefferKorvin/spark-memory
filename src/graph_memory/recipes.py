@@ -36,3 +36,19 @@ async def lookup(repository,query='',limit=100):
     docs=[n for n in nodes if n.kind=='Document' and n.metadata.get('pakt_recipe')]
     docs.sort(key=lambda n:(-len(wanted & terms(n.text)),n.id))
     return {'collection_id':ROOT_ID,'recipes':[{'url':n.metadata['original_uri'],'body':n.metadata['pakt_recipe']} for n in docs[:limit]]}
+
+
+async def migrate(repository):
+    """One-time indexing of recipes already ingested through general memory."""
+    from .models import IngestRequest
+    if await repository.read_record('migration','pakt-recipes-v1'):return
+    count=0
+    for source in await repository.recipe_sources():
+        if source.source_type=='generated' or source.metadata.get('generated'):continue
+        url=source.metadata.get('original_uri') or source.uri
+        try:
+            await ingest(repository,IngestRequest(title=source.label[:300],text='Recipe collection migration',metadata={
+                'original_uri':url,'pakt_recipe':source.metadata.get('pakt_recipe')}))
+            count+=1
+        except (ValueError,TypeError):continue
+    await repository.record('migration','pakt-recipes-v1',{'count':count})

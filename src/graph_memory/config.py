@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     allowed_source_hosts: str = ""
     # Comma-separated online fallbacks for gaps in memory: wikipedia, pubmed, web (DuckDuckGo). Empty disables.
     external_retrievers: str = "wikipedia,pubmed,web"
+    pakt_web_browser: Literal['obscura', 'direct'] = 'obscura'
+    pakt_obscura_command: str = ''
     candidate_limit: int = Field(20, ge=1, le=100)
     # Opening text of retrievable leaves shown to the navigation policy; shortened if the request would not fit.
     navigation_excerpt_tokens: int = Field(80, ge=0, le=1000)
@@ -59,6 +61,20 @@ class Settings(BaseSettings):
     max_external_sources: int = Field(6, ge=0, le=20)
     max_external_rounds: int = Field(1, ge=0, le=3)
     max_active_queries: int = Field(4, ge=1, le=20)
+    # Search memory: a need searched online within this many days is not searched again (0 disables), when its text
+    # or embedding matches. On live needs, paraphrases scored 0.94-0.99 and distinct topics at most 0.924.
+    search_memory_days: float = Field(30, ge=0, le=3650)
+    search_memory_similarity: float = Field(0.94, ge=0, le=1)
+    # Query records and their traces older than this are deleted (0 keeps them); usage records stay for cost accounting.
+    trace_retention_days: float = Field(30, ge=0, le=3650)
+    # Episodes: a question asked again within this many hours (0 disables), in the same scope with the same options,
+    # gets the earlier result unless what the scope reads changed since; paraphrases qualify from this similarity.
+    episode_reuse_hours: float = Field(24, ge=0, le=8760)
+    episode_similarity: float = Field(0.94, ge=0, le=1)
+    episode_retention_days: float = Field(365, ge=0, le=3650)
+    # Retrieval know-how: a web host whose found sources were never accepted nor used after this many is no longer
+    # relevance-checked (0 disables); blocked hosts are always skipped.
+    host_min_trials: int = Field(5, ge=0, le=1000)
     # External sources are ingested and indexed before retrieval resumes.
     query_timeout_seconds: float = Field(600, ge=1, le=3600)
     provider_timeout_seconds: float = Field(45, ge=1, le=300)

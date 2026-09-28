@@ -3,7 +3,7 @@ import logging
 import weakref
 from collections import Counter, defaultdict
 
-from .models import Edge, Relation, Understanding, SourceMetadata, stable_id
+from .models import Edge, Relation, Understanding, SourceMetadata, node_from, stable_id
 from .ontology import CONCURRENCY, OntologyService
 from .parsing import PARSER_VERSION, extract, parse_structure, truncate
 from .sources import SourceService
@@ -32,9 +32,12 @@ class IngestionEngine:
         self.locks = weakref.WeakValueDictionary()
         self.background = set()
 
-    async def ingest(self, request, query_id=None, defer_concepts=False):
+    async def ingest(self, request, query_id=None):
         source, data = await self.sources.identify(request)
-        document_id = stable_id("document", f"{PARSER_VERSION}:{source.mime_type}:{source.content_hash}")
+        scope = request.scope
+        if scope != "shared":  # a private copy: identical content in another scope never merges with it
+            source.id, source.scope = stable_id("source", f"{scope}:{source.id}"), scope
+        document_id = stable_id("document", ("" if scope == "shared" else scope + ":") + f"{PARSER_VERSION}:{source.mime_type}:{source.content_hash}")
         lock = self.locks.setdefault(document_id, asyncio.Lock())
         async with lock:
             existing = await self.repository.get(document_id)
@@ -63,18 +66,80 @@ class IngestionEngine:
             # Tokenizing and chunking large texts is CPU-bound; keep it off the event loop serving live streams.
             parsed = await asyncio.to_thread(parse_structure, text, source.label, document_id, self.settings)
             parsed.document.metadata.update({"formatted_content": text, "content_format": "text" if source.mime_type == "text/plain" else "markdown", "bibliography": metadata.model_dump()})
+            for node in parsed.nodes:
+                node.scope = scope
             understood = await self.understand(parsed, source, query_id)
             # The document hierarchy commits atomically first; it is retrievable without concept links.
             await self.repository.put([source, *parsed.nodes], [Edge(source=source.id, target=document_id, relation=Relation.PROVIDES), *parsed.edges])
             result = {"source_id": source.id, "document_id": document_id, "duplicate": False, "nodes_created": len(parsed.nodes)+1}
-            linking = self.link_concepts(document_id, parsed.nodes, understood, query_id)
-            if not defer_concepts:
-                return {**result, **await linking}
-            # Taxonomy classification takes several model rounds; a waiting query should not pay for it.
-            task = asyncio.create_task(linking)
+            if scope != "shared":
+                # ponytail: private documents stay out of the shared concept graph (no label of theirs can leak into
+                # it); they are found through the indexes, which is where nearly all evidence comes from anyway.
+                return {**result, "concepts": "not linked (private scope)"}
+            return {**result, **await self.link_concepts(document_id, parsed.nodes, understood, query_id)}
+
+    async def ingest_light(self, request, query_id):
+        """Query-time ingestion of a source found online: parse and embed, no other model call. Live queries that
+        searched online made ~630 model calls each (median $0.20, 154 s), nearly all summarizing every section and
+        classifying every concept of pages mostly never used again. A light document that answers a later query is
+        structured then (structure_later). Returns (result, parsed nodes with their embeddings)."""
+        source, data = await self.sources.identify(request)
+        document_id = stable_id("document", f"{PARSER_VERSION}:{source.mime_type}:{source.content_hash}")
+        async with self.locks.setdefault(document_id, asyncio.Lock()):
+            result = {"source_id": source.id, "document_id": document_id, "duplicate": True}
+            if await self.repository.get(document_id):
+                await self.repository.put([source], [Edge(source=source.id, target=document_id, relation=Relation.PROVIDES)])
+                return result, []
+            text = await asyncio.to_thread(extract, data, source.mime_type, self.settings.max_source_bytes)
+            parsed = await asyncio.to_thread(parse_structure, text, source.label, document_id, self.settings)
+            parsed.document.metadata.update({"formatted_content": text, "content_format": "text" if source.mime_type == "text/plain" else "markdown",
+                                             "light": True, "fetched_for": query_id})
+            # ponytail: one embedding request per source; retrievers cap sources at 12k characters, which fits.
+            vectors = await self.models.embed_batch([embedding_text(n) for n in parsed.nodes], query_id)
+            for node, vector in zip(parsed.nodes, vectors):
+                node.embedding = vector
+            await self.repository.put([source, *parsed.nodes], [Edge(source=source.id, target=document_id, relation=Relation.PROVIDES), *parsed.edges])
+            return {**result, "duplicate": False, "nodes_created": len(parsed.nodes) + 1, "light": True}, parsed.nodes
+
+    def structure_later(self, document_ids, query_id):
+        """Structures, in the background, the light documents among these that a query other than the one that
+        fetched them has used: a source that proves useful again earns its summary and concepts."""
+        async def run():
+            for document_id in sorted(document_ids):
+                await self.structure(document_id, query_id)
+        if document_ids:
+            task = asyncio.create_task(run())
             self.background.add(task)
-            task.add_done_callback(self.linked)
-            return {**result, "concepts": "deferred"}
+            task.add_done_callback(self.finished)
+
+    async def structure(self, document_id, query_id=None):
+        """Document-level understanding and its concepts for a light document: one summary call and a few
+        classifications, instead of one per section and one per concept of every section. The bibliographic call
+        adds what freshness needs (publication date, author) to the sources of a page worth keeping."""
+        async with self.locks.setdefault(document_id, asyncio.Lock()):
+            document = await self.repository.get(document_id)
+            if not document or not document.metadata.get("light") or document.metadata.get("fetched_for") == query_id:
+                return None
+            text = document.metadata.get("formatted_content", "")
+            sources = [node_from(s) for s in (await self.repository.provenance(document_id))["sources"]]
+            understanding, metadata = await asyncio.gather(
+                self.models.structured("understanding", {
+                    "title": document.label, "context": document.label, "summary_input": False,
+                    "text": truncate(text, min(10000, self.settings.model_input_token_budget // 2)),
+                    "content_format": document.metadata.get("content_format")}, Understanding),
+                self.models.structured("source_metadata", {
+                    "title": document.label, "url": next((s.uri for s in sources if s.uri), None),
+                    "text": truncate(text, min(8000, self.settings.model_input_token_budget // 2))}, SourceMetadata))
+            document.summary, document.routing_summary = understanding.summary, understanding.routing_summary
+            document.document_type, document.language = understanding.document_type, understanding.language
+            document.metadata.update(temporal_scope=understanding.temporal_scope, light=False, bibliography=metadata.model_dump())
+            document.embedding = await self.models.embed(embedding_text(document))
+            for source in sources:
+                source.author = source.author or metadata.author
+                source.published_at = source.published_at or metadata.published_at
+                source.metadata = {**source.metadata, "bibliography": metadata.model_dump(), "metadata_method": "structured_model"}
+            await self.repository.update_nodes([document, *sources])
+            return await self.link_concepts(document_id, [document], {document.id: understanding})
 
     async def link_concepts(self, document_id, nodes, understood, query_id=None):
         """Resolve each distinct concept once per document (not once per chunk), then attach nodes with ABOUT.
@@ -104,10 +169,10 @@ class IngestionEngine:
         return {"concepts_linked": len(pending), "concepts_extracted": len(specs), "concepts_provisional": len(provisional),
                 "unclassified_concepts": [s["label"] for s in skipped], "classification_skips": dict(reasons)}
 
-    def linked(self, task):
+    def finished(self, task):
         self.background.discard(task)
         if not task.cancelled() and task.exception():
-            logger.warning("Deferred concept linking failed: %s", task.exception())
+            logger.warning("Background structuring failed: %s", task.exception())
 
     async def understand(self, parsed, source, query_id):
         """Bottom-up summaries (children before parents) retain coverage of late sections in long documents;

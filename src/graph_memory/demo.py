@@ -77,18 +77,18 @@ class DemoModels:
             data = {"relevant": relevant, "confidence": 0.8 if relevant else 0.1}
         elif operation == "coverage":
             coverage = []
-            for need in payload["information_needs"]:
-                ids = [e["id"] for e in payload["evidence"] if need["id"] in e["information_need_ids"]]
+            for need in payload["information_needs"]:  # the same lexical test as demo relevance
+                wanted = words(need["description"]) - STOP - {"about"}
+                ids = [e["id"] for e in payload["evidence"] if wanted and len(wanted & words(e["text"])) >= min(2, len(wanted))]
                 coverage.append({"information_need_id": need["id"], "status": "COVERED" if ids else "MISSING",
                                  "evidence_ids": ids, "missing": "" if ids else need["description"]})
             data = {"coverage": coverage, "overall_status": "SUFFICIENT" if all(c["evidence_ids"] for c in coverage) else "INSUFFICIENT"}
-        elif operation == "synthesis":
+        elif operation in ("synthesis", "dossier"):
             evidence = payload["evidence"]
-            prefix = "Offline demo: original evidence excerpts.\n"
-            if payload["coverage"]["overall_status"] != "SUFFICIENT":
-                prefix += "Some information needs remain unanswered.\n"
-            data = {"answer": prefix + "\n".join(f"{e['text']} [{e['id']}]" for e in evidence),
+            data = {"answer": "Offline demo: original evidence excerpts.\n" + "\n".join(f"{e['text']} [{e['id']}]" for e in evidence),
                     "evidence_ids": [e["id"] for e in evidence]}
+        elif operation == "user_facts":
+            data = {"facts": []}  # no inference claims offline
         elif operation == "enrichment":
             text = payload["text"].split(".")[0].strip()
             data = {"assertions": [{"proposition": text, "assertion_type": "claim", "confidence": 0.7,
