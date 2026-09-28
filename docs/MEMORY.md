@@ -98,11 +98,12 @@ float32 vectors truncated to 1,024 dimensions (the embedding model is Matryoshka
 replaces it, and erasing the scope erases them.
 
 Recall (`POST /memory/spark/recall`) makes no model call: entities named in the text (1-6-word phrases, accents
-ignored), the entities and memories closest to its embedding (skipped after 3 s, so a slow provider never stalls a
-chat) and the encounter's working memory seed activation, which spreads one hop over memory-entity-category links
+ignored), the entities and memories closest to its embedding (asked of two providers at once, the first answer wins,
+and skipped after 3 s, so a slow provider never stalls a chat) and the encounter's working memory seed activation, which spreads one hop over memory-entity-category links
 before memories are ranked by activation × temporal × confidence × state × relevance. An `encounter` (PAKT: the coach
 thread, `coach:<goal>`) carries what one message activated into the next for three hours, so "and now?" right after a
-lesson recalls that lesson. Recall runs alone here, so it spreads one hop: on LongMemEval dev that put all the evidence
+lesson recalls that lesson. A session may carry a `subject` (PAKT: the learning goal); a recall naming one multiplies
+other subjects' memories by 0.3, so a history question no longer brings back an AI lesson when history has nothing close. Recall runs alone here, so it spreads one hop: on LongMemEval dev that put all the evidence
 in an 8k-token context for 0.938 of questions against 0.906 with two hops and 0.896 with three, the best-connected
 memories otherwise outranking the directly relevant ones. Where another retriever seeds the graph (hybrid search on
 LongMemEval), three hops did best (0.969).

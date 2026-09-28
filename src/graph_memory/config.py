@@ -18,6 +18,12 @@ class Settings(BaseSettings):
     # GLM 5.3 rejects disabling it (HTTP 400), so it runs at minimal effort (~10 tokens) and is not returned.
     openrouter_options: dict = {"provider": {"sort": "throughput", "require_parameters": True},
                                 "reasoning": {"effort": "minimal", "exclude": True}}
+    # Work nobody waits on (llm.BACKGROUND: ingestion, classification, SPARK extraction) takes the cheapest GLM endpoints
+    # instead: 3.3x cheaper and 2-4x slower in the 2026-09-28 bake-off on calls shaped like each operation (throughput
+    # routing lands on providers charging 3.3x GLM's list price). Sail Research charges 4x more for output: never used.
+    openrouter_background_options: dict = {"provider": {"order": ["InferenceNet", "DeepInfra"], "allow_fallbacks": True,
+                                                        "ignore": ["Sail Research"], "require_parameters": True},
+                                           "reasoning": {"effort": "minimal", "exclude": True}}
     primary_ontology: str = "UNESCO"
     public_web_enabled: bool = True
     embedding_model: str = ""

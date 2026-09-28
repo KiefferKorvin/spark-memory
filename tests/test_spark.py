@@ -91,3 +91,14 @@ def test_api_requires_a_private_scope_and_erasing_the_scope_forgets(tmp_path):
         assert client.post("/memory/spark/recall", json=recall).json()["memories"]
         assert client.delete("/memory/scopes/user:7").status_code == 200
         assert client.post("/memory/spark/recall", json=recall).json()["memories"] == []
+
+
+async def test_recall_for_a_subject_damps_the_others():
+    memory = SparkMemory(None, InMemoryGraph(), Models())
+    await memory.remember(session(subject="Batterie"))
+    await memory.remember(SessionRequest(scope="user:7", session="lesson-9-1", title="Rudiments au clavier", kind="lesson",
+                                         subject="Piano", turns=TURNS))
+    found = await memory.recall(RecallRequest(scope="user:7", text="paradiddle", subject="Batterie", limit=6))
+    rank = {(m["session"], m["text"]): i for i, m in enumerate(found["memories"])}
+    hard = EXTRACTION["memories"][0]["text"]  # the same memory, stored under both subjects
+    assert rank[("Rudiments simples", hard)] == 0 and rank[("Rudiments simples", hard)] < rank[("Rudiments au clavier", hard)]
