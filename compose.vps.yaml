@@ -1,0 +1,24 @@
+# Always-on server next to PAKT (see PAKT's DEPLOY.md): restarts after reboots, bounded memory and logs.
+#   docker compose -f compose.yaml -f compose.pakt.yaml -f compose.vps.yaml up -d --build
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "5"
+services:
+  neo4j:
+    restart: unless-stopped
+    environment:
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP:-1g}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-1g}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-1g}
+    mem_limit: ${NEO4J_MEM:-3g}
+    logging: *logging
+  api:
+    restart: unless-stopped
+    mem_limit: ${MEMORY_API_MEM:-2g}
+    logging: *logging
+  ui:
+    restart: unless-stopped
+    mem_limit: 128m
+    logging: *logging

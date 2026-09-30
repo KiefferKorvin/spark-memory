@@ -49,6 +49,8 @@ The UI is at http://127.0.0.1:5174, API at http://127.0.0.1:8010 and interactive
 
 When memory cannot cover a question, `EXTERNAL_RETRIEVERS` (default `wikipedia,pubmed,web`, all keyless; empty disables) are searched and relevant results ingested; this applies to `live` and `online_demo`. `OPENROUTER_OPTIONS` (JSON) is merged into every chat request; its default prefers high-throughput providers that honour strict JSON schemas and keeps hidden reasoning at minimal effort (GLM 5.3 refuses to disable it), since price-weighted routing was observed at 84 s per call instead of 3 s. `ALLOWED_SOURCE_HOSTS` controls URL ingestion separately, with exact HTTPS hostnames. Empty disables direct remote ingestion. Arbitrary application retrievers implement `ExternalRetriever.search()` and are injected into `Memory`.
 
+On PAKT's server, add `compose.pakt.yaml` and `compose.vps.yaml` (restarts after reboots, bounded Neo4j/API memory and logs); PAKT's `DEPLOY.md` walks through it.
+
 Use one API worker. The API is single-tenant infrastructure; before exposing it beyond localhost, configure `MEMORY_API_TOKEN`, TLS and application authorization. All Compose ports bind to localhost.
 
 ## Docker development with automatic reload
