@@ -11,6 +11,7 @@ names and embedding and by the encounter's working memory (what the conversation
 import asyncio
 import base64
 import datetime as dt
+import hashlib
 import math
 import re
 from array import array
@@ -18,7 +19,7 @@ from typing import Literal
 
 from pydantic import Field
 
-from .associative import AssociativeMemory, Extraction, Params, WorkingMemory, extraction_messages, norm, rounds_of
+from .associative import AssociativeMemory, Extraction, Params, WorkingMemory, cos, extraction_messages, norm, rounds_of
 from .llm import AccountError, ProviderError
 from .models import SCOPE, Strict
 from .prompts import PROMPTS
@@ -33,6 +34,16 @@ CACHE = 64
 # evidence in an 8k-token context for 0.938 of questions with 1 hop, 0.906 with 2 and 0.896 with 3 (hybrid search: 0.896):
 # more hops let the best-connected memories collect activation from every path and outrank the directly relevant ones.
 PARAMS = Params(hops=1)
+DEEP = Params(hops=2)  # the deliberate pass: a wider net, still without a model call
+# A memory that the input names (an entity) or that is this close to it in meaning is about it. Measured with the embedding
+# model on real chats: unrelated messages ("recette de crêpes", "salut", "explique les intégrales") reach 0.31-0.46 of their
+# best memory, real follow-ups 0.44-0.70, so the floor sits at the top of the noise. Without a vector (embedding timed out)
+# nothing can be judged: names and the encounter decide, as before.
+SIM_FLOOR, DEEP_FLOOR = 0.47, 0.40
+RELATIVE = 0.25            # next to the best memory, one scoring under this share of it is noise
+EPISODES, DEEP_EPISODES = 2, 5
+SETTLED = 300              # memories settled at once when listing (pairs are compared in pure Python)
+SAME, SAME_TEXT = 0.85, 0.92  # two memories this close are one fact said again, or changed (see settle)
 ENCOUNTER = r"^[A-Za-z0-9._:-]{1,120}$"
 # Degenerate model output, about 4% of extractions whatever the endpoint ("setFiresVial(YoctoTestRunner.runAll())*flag]]", "[s3]", Chinese in a
 # French session): code or markup debris, or a script the session never uses. Such a memory is dropped, never stored.
@@ -54,6 +65,18 @@ memories: short, self-contained statements that still make sense months later, r
 - confidence: how certain the statement is, from 0 to 1.
 
 entities: every entity named in memories, once, with is_a: one or two general categories it belongs to (e.g. "paradiddle" -> ["rudiment de batterie"], "Cmaj7" -> ["accord"], "passé composé" -> ["temps verbal"])."""
+PROMPTS["spark_episode"] = PROMPTS["spark_extract"] + """
+
+episode: the session as one episode, for the coach to recall what happened. title: 3 to 8 words naming what it was about, written like a heading ("Paradiddles trop rapides à 90 BPM"). text: 2 to 4 complete sentences in the past tense, in the memories' language: what the learner worked on or asked, how it went for them (hard, easy, too long, abandoned...), what the coach advised or proposed, how it ended, and any question or request left open. The same rules as the memories: only what the session shows, no interpretation, no names ("l'apprenant"), numbers copied exactly. Do not write the date, and no filler about how the conversation ended ("la conversation s'est arrêtée là")."""
+
+
+class Episode(Strict):
+    title: str = Field(max_length=120)
+    text: str = Field(max_length=1200)
+
+
+class SparkExtraction(Extraction):
+    episode: Episode
 
 
 class Turn(Strict):
@@ -70,6 +93,7 @@ class SessionRequest(Strict):
     date: dt.date | None = None                 # when the session happened (default today), for relative dates
     turns: list[Turn] = Field(min_length=1, max_length=300)
     encounter: str | None = Field(None, pattern=ENCOUNTER)  # the conversation that continues after it
+    episode: bool = True                        # also write what happened as one episode (a Drifts feed has none)
 
 
 class RecallRequest(Strict):
@@ -79,6 +103,12 @@ class RecallRequest(Strict):
     limit: int = Field(8, ge=1, le=30)
     subject: str = Field("", max_length=200)
     date: dt.date | None = None
+    deep: bool = False                          # the deliberate pass: two hops, a lower floor, more results
+
+
+class ForgetRequest(Strict):
+    scope: str = Field(pattern=SCOPE)
+    ids: list[str] = Field(min_length=1, max_length=50)
 
 
 def pack(vector):
@@ -113,6 +143,62 @@ def short(vector):
     return [x / length for x in head]
 
 
+NUMBER = re.compile(r"\d+(?:[.,]\d+)?")
+
+
+def numbers(text):
+    return frozenset(n.replace(",", ".") for n in NUMBER.findall(text))
+
+
+def ident(session, text):
+    """A memory's stable ID, for the learner to forget it."""
+    return hashlib.sha1(f"{session}|{text}".encode()).hexdigest()[:12]
+
+
+def settle(items):
+    """What the learner said again or changed becomes one memory. Within a group (same subject, learner's or coach's
+    words), memories at least SAME close are linked; the newest of a linked set survives. An older one with the same
+    numbers is a repeat (`seen` counts it), one with other numbers ("20 minutes" then "45") is what it replaced and
+    stays only as `before`. Cosine alone cannot tell them apart: both pairs measured 0.88. Items: id, text, date, score,
+    vec, group; survivors come back by score, with the IDs of everything merged into them."""
+    parent = list(range(len(items)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    figures = [numbers(x["text"]) for x in items]
+    for i, a in enumerate(items):
+        for j in range(i + 1, len(items)):
+            b = items[j]
+            if a["group"] != b["group"]:
+                continue
+            c = cos(a["vec"], b["vec"])
+            repeat = figures[i] == figures[j] and c >= (SAME if figures[i] else SAME_TEXT)
+            change = figures[i] and figures[j] and figures[i] != figures[j] and c >= SAME and a["date"] != b["date"]
+            if repeat or change:
+                parent[find(i)] = find(j)
+    sets = {}
+    for i in range(len(items)):
+        sets.setdefault(find(i), []).append(i)
+    settled = []
+    for members in sets.values():
+        newest = max(members, key=lambda i: (items[i]["date"], items[i]["score"]))
+        item = dict(items[newest], seen=1, before=[], ids=[items[newest]["id"]], score=max(items[i]["score"] for i in members))
+        replaced = {figures[newest]}
+        for i in sorted((i for i in members if i != newest), key=lambda i: items[i]["date"], reverse=True):
+            item["ids"].append(items[i]["id"])
+            if figures[i] == figures[newest]:
+                item["seen"] += 1
+            elif figures[i] not in replaced and len(item["before"]) < 2:  # the latest word of each old value
+                item["before"].append(items[i]["text"])
+                replaced.add(figures[i])
+        settled.append(item)
+    return sorted(settled, key=lambda x: -x["score"])
+
+
 class SparkMemory:
     def __init__(self, settings, repository, models):
         self.settings, self.repository, self.models = settings, repository, models
@@ -121,24 +207,30 @@ class SparkMemory:
     async def remember(self, request):
         day = request.date or dt.date.today()
         text = extraction_messages(rounds_of([t.model_dump() for t in request.turns]), day)[1]["content"]
-        found = await self.models.structured("spark_extract", {"title": request.title, "kind": request.kind, "session": text},
-                                             Extraction)
+        operation, schema = ("spark_episode", SparkExtraction) if request.episode else ("spark_extract", Extraction)
+        found = await self.models.structured(operation, {"title": request.title, "kind": request.kind, "session": text}, schema)
         clean = [m for m in found.memories if not corrupted(m.text, text)]
-        dropped, found.memories = len(found.memories) - len(clean), clean
-        texts = sorted({m.text for m in found.memories} | {n for m in found.memories for n in m.entities}
-                       | {e.name for e in found.entities} | {c for e in found.entities for c in e.is_a})
+        dropped = len(found.memories) - len(clean)
+        episode = getattr(found, "episode", None)
+        if episode and (corrupted(episode.text, text) or corrupted(episode.title, text)):
+            episode, dropped = None, dropped + 1
+        extraction = Extraction(memories=clean, entities=found.entities)
+        texts = sorted({m.text for m in clean} | {n for m in clean for n in m.entities} | {e.name for e in found.entities}
+                       | {c for e in found.entities for c in e.is_a} | ({episode.text} if episode else set()))
         vectors = await self.models.embed_batch(texts) if texts else []
         await self.repository.record("spark", f"{request.scope}|{request.session}", {
             "session": {"id": request.session, "title": request.title, "kind": request.kind, "subject": request.subject,
                         "date": day.isoformat()},
-            "extraction": found.model_dump(), "vectors": {t: pack(short(v)) for t, v in zip(texts, vectors)}})
+            "extraction": extraction.model_dump(), "episode": episode.model_dump() if episode else None,
+            "vectors": {t: pack(short(v)) for t, v in zip(texts, vectors)}})
         self.graphs.pop(request.scope, None)
         if request.encounter:
-            names = {e.name for e in found.entities} | {n for m in found.memories for n in m.entities}
+            names = {e.name for e in found.entities} | {n for m in clean for n in m.entities}
             graph, _ = await self.graph(request.scope)
             self.encounters.add((request.scope, request.encounter),
                                 {node: 1.0 for name in names if (node := graph.names.get(norm(name)))})
-        return {"session": request.session, "memories": len(found.memories), "entities": len(found.entities), "dropped": dropped}
+        return {"session": request.session, "memories": len(clean), "entities": len(found.entities), "dropped": dropped,
+                "date": day.isoformat(), "episode": episode.model_dump() if episode else None}
 
     async def graph(self, scope):
         if scope in self.graphs:
@@ -147,39 +239,93 @@ class SparkMemory:
         for record in await self.repository.records("spark", scope + "|"):
             session = sessions[record["session"]["id"]] = record["session"]
             vectors = {t: unpack(v) for t, v in record["vectors"].items()}
-            graph.add_session(session["id"], dt.date.fromisoformat(session["date"]), [],
-                              Extraction.model_validate(record["extraction"]), vectors)
+            extraction = Extraction.model_validate(record["extraction"])
+            day = dt.date.fromisoformat(session["date"])
+            graph.add_session(session["id"], day, [], extraction, vectors)
+            if episode := record.get("episode"):
+                # Linked to every entity of its session: any of them recalls what happened, as one unit.
+                entities = {n for m in extraction.memories for name in m.entities if (n := graph.names.get(norm(name)))}
+                graph.add_memory(f"m:{session['id']}:episode", episode["text"], vectors.get(episode["text"]), day, session["id"],
+                                 entities=entities, episode=True, title=episode["title"])
         if len(self.graphs) >= CACHE:
             self.graphs.pop(next(iter(self.graphs)))
         self.graphs[scope] = graph, sessions
         return graph, sessions
 
+    def item(self, graph, sessions, node, score):
+        n, session = graph.nodes[node], sessions[graph.nodes[node]["session"]]
+        return {"id": ident(session["id"], n["text"]), "text": n["text"], "state": n["state"], "date": n["date"].isoformat(),
+                "score": score, "vec": n["vec"], "group": (norm(session.get("subject") or ""), n["state"] == "assistant_said"),
+                "session": session["title"], "session_id": session["id"], "kind": session["kind"], "subject": session.get("subject") or ""}
+
     async def recall(self, request):
         graph, sessions = await self.graph(request.scope)
         if not sessions:
-            return {"memories": [], "cues": []}
+            return {"memories": [], "episodes": [], "cues": []}
         try:
             vector = short(await asyncio.wait_for(self.vector(request.text), EMBED_SECONDS))
         except (asyncio.TimeoutError, ProviderError, AccountError):
             vector = None  # names and the encounter still activate the graph
         key = (request.scope, request.encounter) if request.encounter else None
-        ranked = graph.activate(request.text, vector, request.date or dt.date.today(), PARAMS, carry=self.encounters.get(key))
+        ranked = graph.activate(request.text, vector, request.date or dt.date.today(), DEEP if request.deep else PARAMS,
+                                carry=self.encounters.get(key))
         cues = [r for r in ranked if r["kind"] == "entity"][:20]
         if key and cues:
             self.encounters.add(key, {r["id"]: r["activation"] / cues[0]["activation"] for r in cues})
-        memories = [r for r in ranked if r["kind"] == "memory"]
+        named, floor = graph.named(request.text), (DEEP_FLOOR if request.deep else SIM_FLOOR) if vector else 0.0
+        about = [r for r in ranked if r["kind"] == "memory" and (r["similarity"] >= floor or named & set(graph.edges[r["id"]]))]
         if request.subject:  # another subject's memory is rarely the answer; it stays reachable when nothing closer exists
             here = norm(request.subject)
-            for r in memories:
+            for r in about:
                 there = sessions[r["session"]].get("subject")
                 if there and norm(there) != here:
                     r["score"] *= OTHER_SUBJECT
-            memories.sort(key=lambda r: -r["score"])
-        memories = memories[:request.limit]
-        return {"memories": [{"text": r["memory"], "state": r["state"], "date": r["date"], "score": round(r["score"], 4),
-                              "session": sessions[r["session"]]["title"], "kind": sessions[r["session"]]["kind"],
-                              "path": r["activation_path"]} for r in memories],
+            about.sort(key=lambda r: -r["score"])
+        if about:
+            about = [r for r in about if r["score"] >= RELATIVE * about[0]["score"]]
+        recalled = [self.item(graph, sessions, r["id"], r["score"]) | {"episode": graph.nodes[r["id"]].get("episode"),
+                                                                       "title": graph.nodes[r["id"]].get("title")} for r in about]
+        facts = settle([m for m in recalled if not m["episode"]])
+        episodes = [m for m in recalled if m["episode"]][:DEEP_EPISODES if request.deep else EPISODES]
+        return {"memories": [{"id": m["id"], "ids": m["ids"], "text": m["text"], "state": m["state"], "date": m["date"],
+                              "score": round(m["score"], 4), "session": m["session"], "session_id": m["session_id"], "kind": m["kind"], "seen": m["seen"],
+                              "before": m["before"]} for m in facts[:request.limit]],
+                "episodes": [{"id": e["id"], "title": e["title"], "text": e["text"], "date": e["date"], "session": e["session"],
+                              "session_id": e["session_id"], "kind": e["kind"], "subject": e["subject"]} for e in episodes],
                 "cues": [r["memory"] for r in cues[:10]]}
+
+    async def listing(self, scope, subject="", limit=200):
+        """Everything remembered, for the learner to read and forget: facts settled as in recall, and the episodes, newest first."""
+        graph, sessions = await self.graph(scope)
+        nodes = [n for n, v in graph.nodes.items() if v["kind"] == "memory"]
+        if subject:
+            nodes = [n for n in nodes if norm(sessions[graph.nodes[n]["session"]].get("subject") or "") == norm(subject)]
+        episodes = sorted((self.item(graph, sessions, n, 1.0) | {"title": graph.nodes[n]["title"]} for n in nodes if graph.nodes[n].get("episode")),
+                          key=lambda e: (e["date"], e["session"]), reverse=True)
+        newest = sorted((n for n in nodes if not graph.nodes[n].get("episode")), key=lambda n: graph.nodes[n]["date"], reverse=True)[:SETTLED]
+        facts = settle([self.item(graph, sessions, n, graph.nodes[n].get("confidence", 1.0)) for n in newest])  # settle compares pairs
+        facts.sort(key=lambda m: m["date"], reverse=True)
+        drop = {"vec", "group", "score"}
+        return {"episodes": [{k: v for k, v in e.items() if k not in drop} for e in episodes[:limit]],
+                "memories": [{k: v for k, v in m.items() if k not in drop} for m in facts[:limit]]}
+
+    async def forget_memories(self, scope, ids):
+        """Removes memories or episodes by the IDs that recall and listing gave; entities no memory names any more go too."""
+        wanted, removed = set(ids), 0
+        for record in await self.repository.records("spark", scope + "|"):
+            sid, memories = record["session"]["id"], record["extraction"]["memories"]
+            keep = [m for m in memories if ident(sid, m["text"]) not in wanted]
+            episode = record.get("episode")
+            gone = bool(episode) and ident(sid, episode["text"]) in wanted
+            if len(keep) == len(memories) and not gone:
+                continue
+            removed += len(memories) - len(keep) + gone
+            used = {norm(n) for m in keep for n in m["entities"]}
+            record["extraction"] = {"memories": keep, "entities": [e for e in record["extraction"]["entities"] if norm(e["name"]) in used]}
+            record["episode"] = None if gone else episode
+            await self.repository.record("spark", f"{scope}|{sid}", record)
+        self.graphs.pop(scope, None)
+        return {"forgotten": removed}
 
     async def vector(self, text):
         """The text's vector from whichever pinned provider answers first, so one provider's slow spell no longer

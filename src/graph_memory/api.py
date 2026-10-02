@@ -13,7 +13,7 @@ from .config import Settings
 from .llm import AccountError, ProviderError
 from .models import IMAGE_ID, SCOPE, BlockRequest, Fact, FactUpdate, ForgetRequest, ImageRequest, IngestRequest, QueryRequest
 from .service import Memory
-from .spark import RecallRequest, SessionRequest
+from .spark import ForgetRequest, RecallRequest, SessionRequest
 
 
 class BodyLimit:
@@ -230,6 +230,22 @@ def create_app(memory=None):
         """Memories the text activates in the scope, with no model call: for every message of a live conversation."""
         private(body.scope)
         return await service(request).spark.recall(body)
+
+    @app.get("/memory/spark/memories")
+    async def spark_memories(request: Request, scope: str = Query(pattern=SCOPE), subject: str = Query("", max_length=200),
+                             limit: int = Query(200, ge=1, le=500)):
+        """What the scope remembers, for the learner to read: facts settled as in recall, and episodes."""
+        return await service(request).spark.listing(private(scope), subject, limit)
+
+    @app.get("/memory/spark/episodes")
+    async def spark_episodes(request: Request, scope: str = Query(pattern=SCOPE), subject: str = Query("", max_length=200),
+                             limit: int = Query(3, ge=1, le=20)):
+        return {"episodes": (await service(request).spark.listing(private(scope), subject, limit))["episodes"]}
+
+    @app.post("/memory/spark/forget")
+    async def spark_forget(body: ForgetRequest, request: Request):
+        private(body.scope)
+        return await service(request).spark.forget_memories(body.scope, body.ids)
 
     @app.delete("/memory/scopes/{scope}")
     async def erase_scope(scope: str, request: Request):

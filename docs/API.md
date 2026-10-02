@@ -32,8 +32,11 @@ Interactive OpenAPI documentation: `/docs`. Every endpoint accepts `Authorizatio
 | POST | `/memory/images` | Keep a fetched or generated image for reuse |
 | GET | `/memory/images?scope=shared&url=&q=&origin=&limit=20` | The image fetched from `url`, the candidates closest to `q` (with `similarity`), or the latest |
 | GET, DELETE | `/memory/images/{id}?scope=shared` | An image with its base64 `data`; forget it |
-| POST | `/memory/spark/sessions` | A finished session (`scope`, `session`, `title`, `kind`, `date`, `turns`, `encounter`) joins the scope's associative memory: one extraction call ([memory](MEMORY.md)) |
-| POST | `/memory/spark/recall` | Memories a text activates in the scope (`scope`, `text`, `encounter`, `limit`), with their state, date, session and activation path; no model call |
+| POST | `/memory/spark/sessions` | A finished session (`scope`, `session`, `title`, `kind`, `date`, `turns`, `encounter`, `episode`) joins the scope's associative memory: one extraction call that also writes the session's episode (`episode: false` for a feed with none); answers with the `episode` ([memory](MEMORY.md)) |
+| POST | `/memory/spark/recall` | What a text activates in the scope (`scope`, `text`, `encounter`, `subject`, `limit`, `deep`): `memories` (settled facts, each with `id`, `ids`, state, date, `seen`, `before`), `episodes` and `cues`; nothing when the text is about none of them; no model call |
+| GET | `/memory/spark/memories` | Everything a scope remembers (`scope`, `subject`, `limit`): settled `memories` and `episodes`, newest first, each with the IDs to forget |
+| GET | `/memory/spark/episodes` | The scope's latest episodes (`scope`, `subject`, `limit`) |
+| POST | `/memory/spark/forget` | Removes memories or episodes by ID (`scope`, `ids`); entities no memory names any more go too |
 | GET | `/memory/procedures` | Retrieval know-how: per host and retriever, found/accepted/used/forgotten counts and score |
 | POST, DELETE | `/memory/procedures/hosts/{host}/block` | Block (with a reason) or unblock a web host |
 | POST | `/memory/demo/seed` | Synthetic dataset, available only in demo mode |

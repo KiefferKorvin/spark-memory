@@ -112,6 +112,23 @@ in an 8k-token context for 0.938 of questions against 0.906 with two hops and 0.
 memories otherwise outranking the directly relevant ones. Where another retriever seeds the graph (hybrid search on
 LongMemEval), three hops did best (0.969).
 
+A session also leaves one **episode**: a title (3 to 8 words) and 2 to 4 past-tense sentences saying what the learner worked
+on or asked, how it went, what the coach advised and what was left open, under the same rules as the memories (nothing the
+session does not show, no interpretation, no names). Facts are the semantic memory and episodes the episodic one: an
+episode is linked to every entity of its session, so any of them recalls what happened as a unit, and recall returns
+episodes beside the facts (two, five for a deep recall). A feed that is not a conversation asks for no episode.
+
+Recall answers only when the text is about something remembered. A memory counts when the text names one of its entities
+or when its embedding is at least 0.47 cosine close (0.40 for a deep recall): on real chats unrelated messages ("recette de
+crêpes", "salut", "explique-moi les intégrales") reached 0.31-0.46 of their best memory and real follow-ups 0.44-0.70, and
+the 3 s embedding cap still falls back to names and the encounter. Next to the best memory, one scoring under a quarter of
+it is dropped. What the learner said again or changed is then **settled**, within a subject and a speaker: memories at
+least 0.85 close with the same numbers are one fact said again (`seen` counts it), and with other numbers the newest wins
+and the old value comes back as `before` ("45 minutes par jour", before: "20 minutes par jour"): cosine alone cannot tell
+the two apart (both pairs measured 0.88), the numbers can. `deep` is the deliberate pass, with a second hop, a lower floor
+and more results, still without a model call. A learner can read what is remembered (`/memory/spark/memories`) and forget
+any memory or episode by its ID.
+
 PAKT uses it three ways. Every coach message recalls first and gives the memories to the coach, marked as possibly
 outdated and never as sources for facts about the subject. When they, the lesson and the notebook are not enough for a
 factual question, the coach asks for a look-up: a follow-up message answered in the background from `/memory/query`,

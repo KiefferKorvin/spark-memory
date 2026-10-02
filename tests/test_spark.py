@@ -10,7 +10,7 @@ from graph_memory.associative import norm
 from graph_memory.config import Settings
 from graph_memory.graph import InMemoryGraph
 from graph_memory.service import Memory
-from graph_memory.spark import RecallRequest, SessionRequest, SparkMemory
+from graph_memory.spark import ForgetRequest, RecallRequest, SessionRequest, SparkMemory, settle
 
 EXTRACTION = {
     "memories": [
@@ -23,6 +23,8 @@ EXTRACTION = {
     ],
     "entities": [{"name": "paradiddle", "is_a": ["rudiment de batterie"]},
                  {"name": "ghost notes", "is_a": ["technique de batterie"]}]}
+EPISODE = {"title": "Paradiddles trop rapides à 90 BPM",
+           "text": "L'apprenant a travaillé les paradiddles et les a trouvés trop rapides à 90 BPM. Le coach a conseillé de redescendre à 70 BPM."}
 TURNS = [{"role": "assistant", "content": "Leçon « Rudiments simples » : paradiddles et ghost notes."},
          {"role": "user", "content": "Trop dur à 90, et je veux bosser les ghost notes la semaine prochaine."},
          {"role": "assistant", "content": "Redescends à 70 BPM."}]
@@ -42,8 +44,8 @@ class Models:
 
     async def structured(self, operation, payload, schema, query_id=None):
         self.calls.append(operation)
-        assert operation == "spark_extract" and "Trop dur à 90" in payload["session"]
-        return schema.model_validate(EXTRACTION)
+        assert operation in ("spark_extract", "spark_episode") and "Trop dur à 90" in payload["session"]
+        return schema.model_validate({**EXTRACTION, **({"episode": EPISODE} if operation == "spark_episode" else {})})
 
     async def embed(self, text, query_id=None):
         if self.slow:
@@ -115,3 +117,75 @@ def test_corrupted_extractions_are_dropped():
     assert corrupted("Le pied droit (grosse caisse)... ", french)                       # cut off
     assert corrupted("When asked how the lesson went, the learner answered that it was fine.", french)
     assert not corrupted("L'apprenant a trouvé la leçon difficile.", french)
+
+
+async def test_a_session_leaves_an_episode_recalled_with_its_facts_and_listed_newest_first():
+    memory = SparkMemory(None, InMemoryGraph(), Models())
+    stored = await memory.remember(session(date="2026-09-20"))
+    assert stored["episode"] == EPISODE and stored["date"] == "2026-09-20"
+    found = await memory.recall(RecallRequest(scope="user:7", text="on reprend les paradiddles ?"))
+    assert found["episodes"][0]["title"] == EPISODE["title"] and found["episodes"][0]["date"] == "2026-09-20"
+    assert all(m["text"] != EPISODE["text"] for m in found["memories"])             # an episode is not a fact
+    await memory.remember(SessionRequest(scope="user:7", session="chat-1-9", title="Conversation", kind="chat", date="2026-09-25",
+                                         turns=TURNS, episode=False))                # a Drifts feed has no episode
+    listed = await memory.listing("user:7")
+    assert [e["session"] for e in listed["episodes"]] == ["Rudiments simples"] and len(listed["memories"]) == 3
+
+
+async def test_an_unrelated_message_recalls_nothing_but_a_named_concept_or_a_close_meaning_does():
+    memory = SparkMemory(None, InMemoryGraph(), Models())
+    await memory.remember(session())
+    for text in ("recette de crêpes", "météo demain"):  # the fake 64-bucket embedding collides on short words like "salut"
+        found = await memory.recall(RecallRequest(scope="user:7", text=text))
+        assert found["memories"] == [] and found["episodes"] == []
+    assert (await memory.recall(RecallRequest(scope="user:7", text="ghost notes")))["memories"]
+
+
+def item(i, text, date, vec, group=("batterie", False), score=1.0):
+    return dict(id=str(i), text=text, date=date, vec=vec, group=group, score=score)
+
+
+def test_what_was_said_again_merges_and_what_changed_keeps_the_old_value_behind_it():
+    near, other = vector("entraîne minutes jour"), vector("piano clavier")
+    twenty, again, forty_five = (item(1, "20 minutes par jour", "2026-09-20", near), item(2, "20 minutes par jour pour la batterie", "2026-09-25", near),
+                                 item(3, "maintenant 45 minutes par jour", "2026-10-01", near, score=.5))
+    [merged] = settle([twenty, again, forty_five])
+    assert merged["text"] == "maintenant 45 minutes par jour" and merged["before"] == ["20 minutes par jour pour la batterie"] and merged["seen"] == 1
+    assert merged["ids"] == ["3", "2", "1"] and merged["score"] == 1.0
+    [repeat] = settle([twenty, again])
+    assert repeat["text"] == again["text"] and repeat["seen"] == 2 and repeat["before"] == []
+    assert len(settle([twenty, item(4, "20 minutes par jour", "2026-10-02", near, group=("piano", False))])) == 2  # another subject
+    assert len(settle([twenty, item(5, "clavier piano", "2026-10-02", other)])) == 2
+
+
+async def test_forgetting_removes_a_memory_its_entities_and_an_episode():
+    memory = SparkMemory(None, InMemoryGraph(), Models())
+    await memory.remember(session())
+    listed = await memory.listing("user:7")
+    ghost = next(m for m in listed["memories"] if "ghost notes" in m["text"])
+    assert (await memory.forget_memories("user:7", [ghost["id"], listed["episodes"][0]["id"]])) == {"forgotten": 2}
+    after = await memory.listing("user:7")
+    assert all("ghost notes" not in m["text"] for m in after["memories"]) and after["episodes"] == []
+    assert "ghost notes" not in (await memory.recall(RecallRequest(scope="user:7", text="ghost notes")))["cues"]
+
+
+async def test_a_deep_recall_goes_further_than_the_automatic_one():
+    memory = SparkMemory(None, InMemoryGraph(), Models())
+    await memory.remember(session())
+    plain = await memory.recall(RecallRequest(scope="user:7", text="rudiment de batterie"))
+    deep = await memory.recall(RecallRequest(scope="user:7", text="rudiment de batterie", deep=True))
+    assert len(deep["memories"]) >= len(plain["memories"])
+
+
+def test_the_api_lists_forgets_and_serves_episodes():
+    memory = Memory(Settings(memory_mode="demo", _env_file=None), InMemoryGraph(), Models())
+    with TestClient(create_app(memory)) as client:
+        client.post("/memory/spark/sessions", json=session(subject="Batterie").model_dump(mode="json"))
+        assert client.get("/memory/spark/episodes", params={"scope": "shared"}).status_code == 422
+        episodes = client.get("/memory/spark/episodes", params={"scope": "user:7", "subject": "Batterie"}).json()["episodes"]
+        assert [e["title"] for e in episodes] == [EPISODE["title"]]
+        assert client.get("/memory/spark/episodes", params={"scope": "user:7", "subject": "Piano"}).json()["episodes"] == []
+        listed = client.get("/memory/spark/memories", params={"scope": "user:7"}).json()
+        done = client.post("/memory/spark/forget", json={"scope": "user:7", "ids": [m["id"] for m in listed["memories"]]}).json()
+        assert done == {"forgotten": 3}
+        assert client.get("/memory/spark/memories", params={"scope": "user:7"}).json()["memories"] == []

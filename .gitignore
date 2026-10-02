@@ -12,3 +12,6 @@ benchmarks/rag_qa_arena/runs/
 .env.clinical
 benchmarks/longmemeval/runs/
 benchmarks/longmemeval/cache/
+
+# Neo4j exports (neo4j-admin database dump): hundreds of MB, copied to the server by hand, never versioned.
+*.dump

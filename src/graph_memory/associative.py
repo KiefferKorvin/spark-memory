@@ -355,7 +355,7 @@ class AssociativeMemory:
             provenance = p.state_weights.get(node.get("state"), 1.0) * p.source_weights.get(node.get("source"), 1.0)
             relevance = p.relevance_floor + (1 - p.relevance_floor) * max(0.0, rel(n))
             ranked.append({"id": n, "kind": node["kind"], "memory": node["text"],
-                           "score": a * temporal * confidence * provenance * relevance, "activation": a,
+                           "score": a * temporal * confidence * provenance * relevance, "activation": a, "similarity": rel(n),
                            "activation_path": path[n], "state": node.get("state"), "date": node["date"].isoformat(),
                            "session": node["session"], "round": n if node["kind"] == "round" else node["round"]})
         return sorted(ranked, key=lambda r: -r["score"])
